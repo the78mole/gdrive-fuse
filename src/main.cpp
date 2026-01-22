@@ -25,7 +25,8 @@ int main(int argc, char* argv[]) {
     std::string client_secret;
     bool debug = false;
     int fuse_argc = 0;
-    char* fuse_argv[argc];
+    std::vector<char*> fuse_argv_vec;
+    fuse_argv_vec.reserve(argc);
     
     for (int i = 0; i < argc; ++i) {
         std::string arg = argv[i];
@@ -41,7 +42,8 @@ int main(int argc, char* argv[]) {
             debug = true;
         } else {
             // Pass to FUSE
-            fuse_argv[fuse_argc++] = argv[i];
+            fuse_argv_vec.push_back(argv[i]);
+            fuse_argc++;
         }
     }
     
@@ -92,7 +94,7 @@ int main(int argc, char* argv[]) {
         spdlog::info("Mounting filesystem...");
         
         // Run FUSE main loop
-        int ret = fuse_main(fuse_argc, fuse_argv, &ops, nullptr);
+        int ret = fuse_main(fuse_argc, fuse_argv_vec.data(), &ops, nullptr);
         
         spdlog::info("Filesystem unmounted");
         
