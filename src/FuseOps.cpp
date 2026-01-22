@@ -150,6 +150,9 @@ int FuseOps::read(const char* path, char* buf, size_t size, off_t offset,
         }
         
         // Download file content
+        // Note: This is a simplified implementation that downloads the entire file.
+        // A production implementation should use range requests or implement a caching layer
+        // to handle large files efficiently and support partial reads without full downloads.
         std::string content = instance_->client_->downloadFile(file_id);
         
         if (content.empty()) {

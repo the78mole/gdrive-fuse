@@ -191,6 +191,9 @@ nlohmann::json GClient::makeRequest(const std::string& endpoint, const std::stri
             cpr::Url{url},
             cpr::Bearer{token}
         );
+    } else {
+        spdlog::error("Unsupported HTTP method: {}", method);
+        return nlohmann::json();
     }
     
     if (response.status_code < 200 || response.status_code >= 300) {

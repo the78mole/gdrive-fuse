@@ -25,6 +25,8 @@ int main(int argc, char* argv[]) {
     std::string client_secret;
     bool debug = false;
     int fuse_argc = 0;
+    // Store pointers to argv elements for FUSE
+    // These pointers remain valid for the lifetime of main()
     std::vector<char*> fuse_argv_vec;
     fuse_argv_vec.reserve(argc);
     
