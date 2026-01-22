@@ -3,6 +3,7 @@
 #include <cpr/cpr.h>
 #include <fstream>
 #include <chrono>
+#include <thread>
 
 namespace gdrive_fuse {
 
