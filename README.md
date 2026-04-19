@@ -1,137 +1,135 @@
 # gdrive-fuse
 
-A C++20 CLI-only implementation of Google Drive FUSE filesystem with modern C++ design.
+A C++20 implementation of a Google Drive FUSE filesystem with modern C++ design,
+ETag-based caching, and a background change watcher.
 
 ## Features
 
-- **OAuth2 Device Authorization Flow**: Headless authentication suitable for servers and remote systems
-- **Google Drive REST API**: Full integration with Google Drive v3 API
+- **OAuth2 Authorization Code Flow**: Browser-based authentication with automatic local callback server
+- **Google Drive REST API v3**: Full integration for listing, reading, uploading, and deleting files
 - **FUSE3 Support**: Mount Google Drive as a local filesystem
-- **Thread-Safe Design**: All operations are thread-safe using modern C++ primitives
-- **Modern C++20**: Uses C++20 features and best practices
+- **3-State Directory Cache**: `INVALID → FRESH → STALE` cycle with ETag revalidation to minimise API calls
+- **Metadata Cache**: Per-file attribute cache populated during `readdir` — no extra API calls for `getattr`
+- **Background Change Watcher**: Polls the Drive Changes API every 30 s and auto-invalidates stale cache entries
+- **Google Workspace shortcuts**: Docs, Sheets, Slides, etc. are exposed as `.desktop` files that open the browser directly
+- **Thread-Safe Design**: All operations protected with `std::mutex` / `std::atomic`
+- **Modern C++20**: Smart pointers, structured bindings, `std::optional`, `std::condition_variable`
 
 ## Architecture
 
 The project is structured into four main components:
 
-1. **Auth**: Implements OAuth2 Device Authorization Flow for headless authentication
-   - Handles token acquisition, refresh, and persistence
-   - Thread-safe token management
+1. **Auth** (`src/Auth.cpp`)
+   - OAuth2 Authorization Code Flow with a temporary local HTTP server on `localhost:8080`
+   - Automatic token refresh; tokens persisted in `.gdrive_tokens.json`
 
-2. **GClient**: Google Drive REST API wrapper
-   - List files and directories
-   - Upload and download files
-   - Delete files
-   - Get file metadata
+2. **GClient** (`src/GClient.cpp`)
+   - Google Drive REST API wrapper (list, download, upload, delete)
+   - `listFiles()` returns `DirListing{files, etag}`
+   - `revalidateDir()` sends `If-None-Match` and returns `std::nullopt` on HTTP 304 (cache still valid)
+   - Background change watcher thread: `startChangeWatcher()` / `stopChangeWatcher()`
 
-3. **FuseOps**: FUSE filesystem operations
-   - `getattr`: Get file attributes
-   - `readdir`: Read directory contents
-   - `read`: Read file contents
-   - Path-to-ID caching for performance
+3. **FuseOps** (`src/FuseOps.cpp`)
+   - Implements `getattr`, `readdir`, `read`
+   - 3-state directory cache (`DirCacheState`: `INVALID`, `FRESH`, `STALE`) with 30 s TTL
+   - Metadata cache populated during `readdir` — `getattr` never needs a separate API call
+   - Google Workspace files (`application/vnd.google-apps.*`) displayed as `.desktop` shortcuts
+   - `invalidateDirCache()` called by the change watcher callback
 
-4. **main**: CLI entry point
-   - Command-line argument parsing
-   - FUSE initialization
+4. **main** (`src/main.cpp`)
+   - CLI argument parsing
    - Authentication orchestration
+   - FUSE initialisation and main loop
 
 ## Dependencies
 
-- **FUSE3**: Filesystem in Userspace
-- **cpr**: HTTP client library (wrapper around libcurl)
-- **nlohmann/json**: JSON parsing and serialization
-- **spdlog**: Fast logging library
-
-All dependencies except FUSE3 are automatically fetched using CMake FetchContent.
+- **FUSE3** (`libfuse3-dev`) — system package, must be installed manually
+- **OpenSSL** (`libssl-dev`) — system package, must be installed manually
+- **cpr** 1.10.5, **nlohmann/json** 3.11.3, **spdlog** 1.13.0 — fetched automatically via CMake FetchContent
 
 ## Building
 
 ### Prerequisites
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install libfuse3-dev pkg-config cmake build-essential
+# Ubuntu / Debian / Linux Mint
+sudo apt-get install build-essential cmake pkg-config libfuse3-dev libssl-dev
 
-# Fedora/RHEL
-sudo dnf install fuse3-devel pkgconfig cmake gcc-c++
-
-# macOS
-brew install macfuse cmake
+# Fedora / RHEL
+sudo dnf install gcc-c++ cmake pkgconfig fuse3-devel openssl-devel
 ```
 
-### Build Steps
+See [docs/BUILD.md](docs/BUILD.md) for full instructions including CI setup.
+
+### Quick start
 
 ```bash
-mkdir build
-cd build
-cmake ..
-make -j$(nproc)
+git clone https://github.com/the78mole/gdrive-fuse.git
+cd gdrive-fuse
+make build          # Debug build → build/gdrive-fuse
+make install-hooks  # Install pre-commit + commit-msg hooks
 ```
-
-The executable `gdrive-fuse` will be created in the build directory.
 
 ## Usage
 
 ### Setup Google Cloud OAuth2 Credentials
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Enable the Google Drive API
-4. Create OAuth2 credentials (Desktop application)
-5. Note down your Client ID and Client Secret
+1. Create a project in the [Google Cloud Console](https://console.cloud.google.com/) and enable the **Google Drive API**.
+2. Go to **APIs & Services → OAuth consent screen** → set audience to **External** and add your Google account as a **Test user**.
+3. Go to **APIs & Services → Credentials → + Create Credentials → OAuth client ID** → Application type: **Desktop app**.
+4. Download the JSON and save it as `credentials.json` in the project root.
 
-### Mount Google Drive
-
-```bash
-./gdrive-fuse --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET /mnt/gdrive
-```
-
-On first run, you'll see a URL and code:
-```
-Please visit: https://www.google.com/device and enter code: XXXX-XXXX
-```
-
-Visit the URL in a browser, enter the code, and authorize the application.
-
-### Additional Options
+### Run
 
 ```bash
-# Enable debug logging
-./gdrive-fuse --client-id ID --client-secret SECRET --debug /mnt/gdrive
+# With Make (default mount point: /home/mnt/gdrive-fuse)
+make run CLIENT_ID=<your-client-id> CLIENT_SECRET=<your-client-secret>
 
-# Pass FUSE options
-./gdrive-fuse --client-id ID --client-secret SECRET /mnt/gdrive -f -o allow_other
+# Custom mount point
+make run CLIENT_ID=<id> CLIENT_SECRET=<secret> MOUNT_POINT=/mnt/gdrive
+
+# Directly with debug logging
+mkdir -p /tmp/gdrive-mount
+./build/gdrive-fuse --client-id <id> --client-secret <secret> --debug /tmp/gdrive-mount -f
 ```
+
+On **first run** a browser window opens automatically for OAuth2 authorisation.
+The access token is cached in `.gdrive_tokens.json` and refreshed automatically.
+
+### Google Workspace files (Docs, Sheets, Slides …)
+
+Files with a `application/vnd.google-apps.*` MIME type have no binary content.
+They appear in the filesystem with a `.desktop` suffix. Double-clicking them in
+a file manager opens the document directly in your browser.
 
 ### Unmount
 
 ```bash
-fusermount -u /mnt/gdrive
+make stop
+# or manually
+fusermount3 -u /home/mnt/gdrive-fuse
 ```
 
 ## Thread Safety
 
-All components are designed to be thread-safe:
+| Component | Mechanism |
+|---|---|
+| `Auth` | `std::mutex` around token state |
+| `GClient` | `std::mutex` around API requests; `std::atomic<bool>` + `std::condition_variable` for the watcher thread |
+| `FuseOps` | `std::mutex` around all cache structures |
 
-- **Auth**: Uses `std::mutex` to protect token state
-- **GClient**: Uses `std::mutex` for API requests
-- **FuseOps**: Uses `std::mutex` for cache operations
-
-FUSE itself may call operations concurrently, so thread safety is critical.
+FUSE may dispatch callbacks concurrently from multiple threads.
 
 ## Security
 
-- Tokens are stored in `.gdrive_tokens.json` in the current directory
-- Make sure to protect this file with appropriate permissions
-- Never commit this file to version control
+- Tokens are stored in `.gdrive_tokens.json` — protect with `chmod 600`.
+- Both `credentials.json` and `.gdrive_tokens.json` are in `.gitignore` and must never be committed.
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please ensure:
-- Code follows C++20 best practices
-- Thread safety is maintained
-- Changes are tested with FUSE operations
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
+coding guidelines, commit message format, and PR process.

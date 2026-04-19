@@ -6,7 +6,9 @@ cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-Makefile
+# Only ignore CMake-generated Makefiles inside the build directory, not the
+# hand-written project Makefile in the repo root.
+build/Makefile
 *.cmake
 
 # Compiled Object files
@@ -46,3 +48,6 @@ gdrive-fuse
 # OS
 .DS_Store
 Thumbs.db
+
+credentials.json
+.gdrive_tokens.json

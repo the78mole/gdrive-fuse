@@ -1,0 +1,32 @@
+name: Question / Support
+description: Ask a question about building, configuring, or using gdrive-fuse
+title: "question: <short description>"
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [docs/BUILD.md](https://github.com/the78mole/gdrive-fuse/blob/main/docs/BUILD.md)
+        and existing issues before asking.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What Have You Already Tried?
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Version
+      placeholder: e.g. Linux Mint 22 / Ubuntu 24.04
+    validations:
+      required: false
