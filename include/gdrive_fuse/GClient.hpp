@@ -148,7 +148,6 @@ public:
 
 private:
     std::shared_ptr<Auth> auth_;
-    mutable std::mutex mutex_;  // For thread-safety
 
     // Change watcher
     std::thread watcher_thread_;

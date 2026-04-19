@@ -5,6 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -99,13 +100,18 @@ public:
 
 private:
     std::shared_ptr<GClient> client_;
-    mutable std::mutex mutex_;  // For thread-safety
+
+    // ── Cache mutex (shared_lock = concurrent reads, unique_lock = writes) ────
+    mutable std::shared_mutex cache_mutex_;
 
     // Cache for path to file ID mapping
     std::unordered_map<std::string, std::string> path_to_id_cache_;
 
     // Cache for file metadata (file_id -> FileInfo)
     std::unordered_map<std::string, GClient::FileInfo> metadata_cache_;
+
+    // Cache for downloaded file content (file_id -> raw bytes)
+    std::unordered_map<std::string, std::string> file_content_cache_;
 
     // Cache for directory listings (parent_id -> entry)
     // State machine:
@@ -125,11 +131,24 @@ private:
     /// Time after which a FRESH entry becomes STALE and triggers an ETag revalidation.
     static constexpr int DIR_CACHE_TTL_SECONDS = 30;
 
+    /// Maximum number of file content entries kept in memory.
+    static constexpr std::size_t FILE_CACHE_MAX_ENTRIES = 64;
+
+    // ── Per-file download mutex ────────────────────────────────────────────────
+    // Different files can be downloaded in parallel; the same file is serialised.
+    std::mutex file_mutex_registry_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> file_mutexes_;
+
     static FuseOps* instance_;  // Singleton instance for callbacks
+
+    /// Returns (or creates) the per-file download mutex for @p file_id.
+    /// Thread-safe; does not require cache_mutex_ to be held.
+    std::shared_ptr<std::mutex> getFileMutex(const std::string& file_id);
 
     std::string getFileIdFromPath(const std::string& path);
 
     /// Populate path_to_id_cache_ and metadata_cache_ from a directory listing.
+    /// Caller must hold a unique_lock on cache_mutex_.
     void populateCaches(const std::string& path_str, const std::vector<GClient::FileInfo>& files);
 };
 

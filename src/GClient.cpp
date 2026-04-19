@@ -40,8 +40,6 @@ std::vector<GClient::FileInfo> GClient::parseFileList(const nlohmann::json& json
 }
 
 GClient::DirListing GClient::listFiles(const std::string& parent_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string query    = "'" + parent_id + "' in parents and trashed = false";
     std::string endpoint = "/files?q=" + cpr::util::urlEncode(query) +
                            "&fields=files(id,name,mimeType,size,modifiedTime)";
@@ -60,8 +58,6 @@ GClient::DirListing GClient::listFiles(const std::string& parent_id) {
 
 std::optional<GClient::DirListing> GClient::revalidateDir(const std::string& parent_id,
                                                           const std::string& etag) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string query    = "'" + parent_id + "' in parents and trashed = false";
     std::string endpoint = "/files?q=" + cpr::util::urlEncode(query) +
                            "&fields=files(id,name,mimeType,size,modifiedTime)";
@@ -84,8 +80,6 @@ std::optional<GClient::DirListing> GClient::revalidateDir(const std::string& par
 }
 
 GClient::FileInfo GClient::getFileMetadata(const std::string& file_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string endpoint = "/files/" + file_id + "?fields=id,name,mimeType,size,modifiedTime";
     auto response_json   = makeRequest(endpoint);
 
@@ -102,8 +96,6 @@ GClient::FileInfo GClient::getFileMetadata(const std::string& file_id) {
 }
 
 std::string GClient::downloadFile(const std::string& file_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string token = auth_->getAccessToken();
     if (token.empty()) {
         spdlog::error("No access token available");
@@ -125,8 +117,6 @@ std::string GClient::downloadFile(const std::string& file_id) {
 
 std::string GClient::uploadFile(const std::string& name, const std::string& content,
                                 const std::string& parent_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string token = auth_->getAccessToken();
     if (token.empty()) {
         spdlog::error("No access token available");
@@ -166,8 +156,6 @@ std::string GClient::uploadFile(const std::string& name, const std::string& cont
 }
 
 bool GClient::deleteFile(const std::string& file_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string token = auth_->getAccessToken();
     if (token.empty()) {
         spdlog::error("No access token available");
