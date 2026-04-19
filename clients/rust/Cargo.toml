@@ -1,0 +1,59 @@
+[package]
+name = "gdrive-fuse-rs"
+version = "1.0.0"
+edition = "2021"
+description = "Google Drive FUSE filesystem — Rust implementation"
+license = "MIT"
+
+[[bin]]
+name = "gdrive-fuse-rs"
+path = "src/main.rs"
+
+[dependencies]
+# FUSE3 bindings
+fuser = "0.14"
+
+# HTTP client (blocking API to keep FUSE callbacks synchronous)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# URL-encode OAuth2 query params (no oauth2 crate — raw HTTP flow)
+urlencoding = "2"
+
+# Credentials / token persistence
+dirs = "5"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Concurrency
+parking_lot = "0.12"
+dashmap = "6"
+crossbeam-channel = "0.5"
+
+# POSIX UID/GID for FUSE getattr
+libc = "0.2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3.27.0"
