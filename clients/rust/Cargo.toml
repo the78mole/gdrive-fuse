@@ -55,5 +55,5 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
-httpmock = "0.7"
+httpmock = "0.8"
 tempfile = "3.27.0"
