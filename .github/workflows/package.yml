@@ -21,7 +21,7 @@ jobs:
       full: ${{ steps.compose.outputs.full }}  # e.g. 1.2.3  or  1.2.3-pr15-3-gabcdef
       deb:  ${{ steps.compose.outputs.deb }}   # Debian-compatible, e.g. 1.2.3  or  1.2.3~pr15.3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0   # full history required by paulhatch/semantic-version
 
@@ -72,7 +72,7 @@ jobs:
       GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: |
@@ -155,7 +155,7 @@ jobs:
       GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         run: |
