@@ -132,7 +132,7 @@ jobs:
             "gdrive-fuse-cpp_${DEB_VERSION}_${DEB_ARCH}.deb"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gdrive-fuse-cpp_${{ matrix.deb_arch }}
           path: clients/cpp/gdrive-fuse-cpp_*.deb
@@ -180,7 +180,7 @@ jobs:
         run: cargo deb --deb-version "${DEB_VERSION}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gdrive-fuse-rs_${{ matrix.deb_arch }}
           path: clients/rust/target/debian/*.deb
@@ -195,7 +195,7 @@ jobs:
 
     steps:
       - name: Download all .deb artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: debs
           merge-multiple: true
