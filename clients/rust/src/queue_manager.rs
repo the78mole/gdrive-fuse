@@ -57,21 +57,39 @@ pub enum TaskKey {
     /// Fetch or revalidate a directory listing (worker decides which based on
     /// cache state: revalidate if there is a stale ETag, cold fetch otherwise).
     FetchDir(String),
+    /// Fetch only the **first page** of a directory listing and store a
+    /// partial result.  A separate `FetchDirPages` task is enqueued at Low
+    /// priority to retrieve the remaining pages.
+    FetchDirFirstPage(String),
+    /// Fetch all remaining pages of a directory listing, continuing from the
+    /// stored partial result.  The `String` fields are:
+    /// `(parent_id, page_token, etag)`.
+    FetchDirPages(String, String, String),
     /// Fetch metadata for a single file.
     GetMetadata(String),
-    /// Download the full content of a file.
+    /// Download the full content of a file (≤ `SMALL_FILE_MAX_BYTES`).
     DownloadFile(String),
+    /// Download a specific byte range of a file (used for large files).
+    /// Fields: `(file_id, offset, length)`.  Results are NOT cached.
+    DownloadFileRange(String, u64, u32),
 }
 
 // ── TaskResult ─────────────────────────────────────────────────────────────
 
 /// Value stored in `ObjectManager` and returned to `enqueue_and_wait` callers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TaskResult {
-    DirListing,   // listing already stored in ObjectManager by the worker
-    NotModified,  // 304 — existing listing refreshed (touch_dir called)
-    FileMetadata, // metadata already stored
-    FileContent,  // content already stored
+    DirListing,
+    /// First page stored; `Some((page_token, etag))` when more pages remain.
+    /// The caller (fuse_ops) must enqueue `TaskKey::FetchDirPages` at Low
+    /// priority to retrieve the remaining pages.
+    #[allow(dead_code)]
+    DirListingPartial(Option<(String, String)>),
+    NotModified,
+    FileMetadata,
+    FileContent,
+    /// Range bytes returned directly to the caller — not stored in the cache.
+    FileContentRange(Vec<u8>),
 }
 
 // ── TaskCompletion ─────────────────────────────────────────────────────────
@@ -134,10 +152,20 @@ impl QueueManager {
     ///
     /// Workers are daemon-like: they run until the channels are dropped (i.e.
     /// when the `QueueManager` itself is dropped on process exit).
+    /// Creates a `QueueManager` with a fixed worker-pool layout:
+    ///
+    /// | Pool             | Count | Queues served        | Purpose                          |
+    /// |------------------|-------|----------------------|----------------------------------|
+    /// | Full workers     |     8 | High + Normal + Low  | User-triggered FUSE ops + spill  |
+    /// | Dir-prefetch     |     4 | Normal + Low         | Background directory listings    |
+    /// | File-prefetch    |     1 | Low only             | Background small-file downloads  |
+    ///
+    /// Keeping dedicated Low/Normal-only workers ensures that a burst of
+    /// background prefetch tasks can never starve the High-priority lane that
+    /// serves interactive FUSE operations.
     pub fn new(
         object_manager: Arc<ObjectManager>,
         client: Arc<GClient>,
-        num_workers: usize,
     ) -> Arc<Self> {
         let (high_tx, high_rx) = unbounded::<Task>();
         let (normal_tx, normal_rx) = unbounded::<Task>();
@@ -157,17 +185,50 @@ impl QueueManager {
             tracking: Arc::clone(&tracking),
         });
 
-        info!("QueueManager: spawning {} worker threads", num_workers);
-        for i in 0..num_workers {
-            let high_rx = high_rx.clone();
-            let normal_rx = normal_rx.clone();
-            let low_rx = low_rx.clone();
-            let tracking_ref = Arc::clone(&tracking);
-            let obj = Arc::clone(&object_manager);
-            let cli = Arc::clone(&client);
+        // ── Full workers (High + Normal + Low) ─────────────────────────────
+        const FULL_WORKERS: usize = 8;
+        // ── Dir-prefetch workers (Normal + Low only) ───────────────────────
+        const DIR_WORKERS: usize = 4;
+        // ── Small-file workers (Low only, ≤ 64 KiB) ───────────────────────
+        // 24 workers flush large directories quickly without competing with
+        // the interactive Full/Dir-prefetch pools.
+        const FILE_WORKERS: usize = 24;
+
+        let total = FULL_WORKERS + DIR_WORKERS + FILE_WORKERS;
+        info!(
+            "QueueManager: spawning {} workers ({} full, {} dir-prefetch, {} small-file)",
+            total, FULL_WORKERS, DIR_WORKERS, FILE_WORKERS
+        );
+
+        let mut id = 0usize;
+
+        for _ in 0..FULL_WORKERS {
+            let (h, n, l) = (high_rx.clone(), normal_rx.clone(), low_rx.clone());
+            let (tr, obj, cli) = (Arc::clone(&tracking), Arc::clone(&object_manager), Arc::clone(&client));
+            let worker_id = id; id += 1;
             std::thread::Builder::new()
-                .name(format!("gdrive-worker-{}", i))
-                .spawn(move || worker_loop(i, high_rx, normal_rx, low_rx, tracking_ref, obj, cli))
+                .name(format!("gdrive-full-{}", worker_id))
+                .spawn(move || worker_loop(worker_id, h, n, l, tr, obj, cli))
+                .expect("failed to spawn worker thread");
+        }
+
+        for _ in 0..DIR_WORKERS {
+            let (n, l) = (normal_rx.clone(), low_rx.clone());
+            let (tr, obj, cli) = (Arc::clone(&tracking), Arc::clone(&object_manager), Arc::clone(&client));
+            let worker_id = id; id += 1;
+            std::thread::Builder::new()
+                .name(format!("gdrive-dir-{}", worker_id))
+                .spawn(move || worker_loop_dir(worker_id, n, l, tr, obj, cli))
+                .expect("failed to spawn worker thread");
+        }
+
+        for _ in 0..FILE_WORKERS {
+            let l = low_rx.clone();
+            let (tr, obj, cli) = (Arc::clone(&tracking), Arc::clone(&object_manager), Arc::clone(&client));
+            let worker_id = id; id += 1;
+            std::thread::Builder::new()
+                .name(format!("gdrive-file-{}", worker_id))
+                .spawn(move || worker_loop_file(worker_id, l, tr, obj, cli))
                 .expect("failed to spawn worker thread");
         }
 
@@ -231,7 +292,7 @@ fn worker_loop(
     obj: Arc<ObjectManager>,
     client: Arc<GClient>,
 ) {
-    debug!("worker-{}: started", id);
+    debug!("worker-full-{}: started", id);
     loop {
         // Poll higher-priority queues without blocking first, then do a
         // blocking select across all three.  This gives HIGH strict priority
@@ -242,58 +303,144 @@ fn worker_loop(
             t
         } else {
             crossbeam_channel::select! {
-                recv(high)   -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-{}: channel closed", id); return; } },
-                recv(normal) -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-{}: channel closed", id); return; } },
-                recv(low)    -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-{}: channel closed", id); return; } },
+                recv(high)   -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-full-{}: channel closed", id); return; } },
+                recv(normal) -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-full-{}: channel closed", id); return; } },
+                recv(low)    -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-full-{}: channel closed", id); return; } },
             }
         };
+        run_task(id, "full", task, &tracking, &obj, &client);
+    }
+}
 
-        debug!("worker-{}: executing {:?}", id, task.key);
-
-        // Execute the Drive API call.
-        let api_result = execute_task(&task.key, &obj, &client);
-
-        // Store the result in ObjectManager.
-        let task_result = match &api_result {
-            Ok(crate::gclient::ApiOutcome::DirListing(listing)) => {
-                if let TaskKey::FetchDir(parent_id) = &task.key {
-                    obj.store_dir_listing(parent_id, listing.clone());
-                }
-                Ok(TaskResult::DirListing)
-            }
-            Ok(crate::gclient::ApiOutcome::NotModified) => {
-                if let TaskKey::FetchDir(parent_id) = &task.key {
-                    if obj.touch_dir(parent_id).is_none() {
-                        // Entry vanished (race) — re-fetch.  This is a
-                        // rare code path; error is non-fatal.
-                        error!("worker-{}: touch_dir('{}') miss after 304", id, parent_id);
-                    }
-                }
-                Ok(TaskResult::NotModified)
-            }
-            Ok(crate::gclient::ApiOutcome::FileMetadata(info)) => {
-                obj.store_metadata(info.clone());
-                Ok(TaskResult::FileMetadata)
-            }
-            Ok(crate::gclient::ApiOutcome::FileContent(bytes)) => {
-                if let TaskKey::DownloadFile(file_id) = &task.key {
-                    obj.store_content(file_id, bytes.clone());
-                }
-                Ok(TaskResult::FileContent)
-            }
-            Err(e) => {
-                error!("worker-{}: {:?} failed: {}", id, task.key, e);
-                Err(e.clone())
+/// Worker that serves only the **Normal** and **Low** queues.
+/// Used for background directory prefetch; never blocks High-priority FUSE ops.
+fn worker_loop_dir(
+    id: usize,
+    normal: Receiver<Task>,
+    low: Receiver<Task>,
+    tracking: Arc<DashMap<TaskKey, Vec<Arc<TaskCompletion>>>>,
+    obj: Arc<ObjectManager>,
+    client: Arc<GClient>,
+) {
+    debug!("worker-dir-{}: started", id);
+    loop {
+        let task = if let Ok(t) = normal.try_recv() {
+            t
+        } else {
+            crossbeam_channel::select! {
+                recv(normal) -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-dir-{}: channel closed", id); return; } },
+                recv(low)    -> msg => match msg { Ok(t) => t, Err(_) => { debug!("worker-dir-{}: channel closed", id); return; } },
             }
         };
+        run_task(id, "dir", task, &tracking, &obj, &client);
+    }
+}
 
-        // Remove from tracking and wake all waiters (including any that were
-        // attached after the task was dequeued from the channel).
-        let completions = tracking.remove(&task.key).map(|(_, v)| v).unwrap_or_default();
-        debug!("worker-{}: {:?} done, notifying {} waiters", id, task.key, completions.len());
-        for c in &completions {
-            c.complete(task_result.clone());
+/// Worker that serves **only** the Low queue.
+/// Used for small-file prefetch; never competes with interative paths.
+fn worker_loop_file(
+    id: usize,
+    low: Receiver<Task>,
+    tracking: Arc<DashMap<TaskKey, Vec<Arc<TaskCompletion>>>>,
+    obj: Arc<ObjectManager>,
+    client: Arc<GClient>,
+) {
+    debug!("worker-file-{}: started", id);
+    loop {
+        let task = match low.recv() {
+            Ok(t) => t,
+            Err(_) => { debug!("worker-file-{}: channel closed", id); return; }
+        };
+        run_task(id, "file", task, &tracking, &obj, &client);
+    }
+}
+
+/// Execute `task`, store any result in `ObjectManager`, and notify waiters.
+/// Extracted from `worker_loop` so all three worker variants share it.
+fn run_task(
+    id: usize,
+    kind: &str,
+    task: Task,
+    tracking: &Arc<DashMap<TaskKey, Vec<Arc<TaskCompletion>>>>,
+    obj: &Arc<ObjectManager>,
+    client: &Arc<GClient>,
+) {
+    debug!("worker-{}-{}: executing {:?}", kind, id, task.key);
+
+    let api_result = execute_task(&task.key, obj, client);
+
+    let task_result = match &api_result {
+        Ok(crate::gclient::ApiOutcome::DirListing(listing)) => {
+            if let TaskKey::FetchDir(parent_id) | TaskKey::FetchDirPages(parent_id, _, _) =
+                &task.key
+            {
+                obj.store_dir_listing(parent_id, listing.clone());
+            }
+            Ok(TaskResult::DirListing)
         }
+        Ok(crate::gclient::ApiOutcome::DirListingFirstPage {
+            files,
+            next_page_token,
+            etag,
+        }) => {
+            if let TaskKey::FetchDirFirstPage(parent_id) = &task.key {
+                obj.store_dir_partial(parent_id, files.clone(), etag.clone());
+                if let Some(pt) = next_page_token {
+                    info!(
+                        "worker-{}-{}: first page stored for '{}' ({} files), \
+                         continuation will be enqueued by caller",
+                        kind, id, parent_id, files.len()
+                    );
+                    Ok(TaskResult::DirListingPartial(Some((pt.clone(), etag.clone()))))
+                } else {
+                    obj.store_dir_listing(
+                        parent_id,
+                        crate::gclient::DirListing {
+                            files: files.clone(),
+                            etag: etag.clone(),
+                        },
+                    );
+                    info!(
+                        "worker-{}-{}: single-page fetch complete for '{}' ({} files)",
+                        kind, id, parent_id, files.len()
+                    );
+                    Ok(TaskResult::DirListing)
+                }
+            } else {
+                Ok(TaskResult::DirListingPartial(None))
+            }
+        }
+        Ok(crate::gclient::ApiOutcome::NotModified) => {
+            if let TaskKey::FetchDir(parent_id) = &task.key {
+                if obj.touch_dir(parent_id).is_none() {
+                    error!("worker-{}-{}: touch_dir('{}') miss after 304", kind, id, parent_id);
+                }
+            }
+            Ok(TaskResult::NotModified)
+        }
+        Ok(crate::gclient::ApiOutcome::FileMetadata(info)) => {
+            obj.store_metadata(info.clone());
+            Ok(TaskResult::FileMetadata)
+        }
+        Ok(crate::gclient::ApiOutcome::FileContent(bytes)) => {
+            if let TaskKey::DownloadFile(file_id) = &task.key {
+                obj.store_content(file_id, bytes.clone());
+            }
+            Ok(TaskResult::FileContent)
+        }
+        Ok(crate::gclient::ApiOutcome::FileContentRange(bytes)) => {
+            Ok(TaskResult::FileContentRange(bytes.clone()))
+        }
+        Err(e) => {
+            error!("worker-{}-{}: {:?} failed: {}", kind, id, task.key, e);
+            Err(e.clone())
+        }
+    };
+
+    let completions = tracking.remove(&task.key).map(|(_, v)| v).unwrap_or_default();
+    debug!("worker-{}-{}: {:?} done, notifying {} waiters", kind, id, task.key, completions.len());
+    for c in &completions {
+        c.complete(task_result.clone());
     }
 }
 
@@ -326,6 +473,37 @@ fn execute_task(
                 .map(crate::gclient::ApiOutcome::DirListing)
                 .map_err(|e| e.to_string())
         }
+        TaskKey::FetchDirFirstPage(parent_id) => {
+            // Fetch only the first page so FUSE readdir can return partial
+            // results immediately.  If there are more pages a FetchDirPages
+            // continuation task is signalled via the outcome.
+            client
+                .list_files_first_page(parent_id)
+                .map(|(files, next_page_token, etag)| {
+                    crate::gclient::ApiOutcome::DirListingFirstPage { files, next_page_token, etag }
+                })
+                .map_err(|e| e.to_string())
+        }
+        TaskKey::FetchDirPages(parent_id, page_token, etag) => {
+            // If the cache was already completed by a concurrent FetchDir
+            // (e.g. startup-prefetch), skip the continuation to avoid
+            // replacing the full listing with only the remaining pages.
+            if obj.is_dir_complete(parent_id) {
+                debug!(
+                    "execute_task: FetchDirPages('{}') skipped \
+                     — cache already complete",
+                    parent_id
+                );
+                return Ok(crate::gclient::ApiOutcome::NotModified);
+            }
+            // Use the already-cached first page as the accumulator so the
+            // final listing contains all entries (page 1 + pages 2..n).
+            let accumulator = obj.get_dir_files(parent_id).unwrap_or_default();
+            client
+                .list_files_pages(parent_id, page_token.clone(), accumulator, etag.clone())
+                .map(crate::gclient::ApiOutcome::DirListing)
+                .map_err(|e| e.to_string())
+        }
         TaskKey::GetMetadata(file_id) => client
             .get_file_metadata(file_id)
             .map(crate::gclient::ApiOutcome::FileMetadata)
@@ -333,6 +511,10 @@ fn execute_task(
         TaskKey::DownloadFile(file_id) => client
             .download_file(file_id)
             .map(crate::gclient::ApiOutcome::FileContent)
+            .map_err(|e| e.to_string()),
+        TaskKey::DownloadFileRange(file_id, offset, length) => client
+            .download_file_range(file_id, *offset, *length)
+            .map(crate::gclient::ApiOutcome::FileContentRange)
             .map_err(|e| e.to_string()),
     }
 }
@@ -387,7 +569,7 @@ mod tests {
         });
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 2);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result =
             qm.enqueue_and_wait(TaskKey::FetchDir("root".to_string()), Priority::High);
@@ -408,7 +590,7 @@ mod tests {
         });
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 2);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result =
             qm.enqueue_and_wait(TaskKey::FetchDir("some-dir".to_string()), Priority::High);
@@ -434,7 +616,7 @@ mod tests {
         });
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 2);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result = qm
             .enqueue_and_wait(TaskKey::GetMetadata("meta-file-id".to_string()), Priority::High);
@@ -455,7 +637,7 @@ mod tests {
         });
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 2);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result = qm.enqueue_and_wait(
             TaskKey::DownloadFile("dl-file-id".to_string()),
@@ -475,7 +657,7 @@ mod tests {
         let mock = empty_listing_mock(&server);
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 1);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
         let qm2 = Arc::clone(&qm);
 
         // Launch two threads; both request the same directory.
@@ -505,7 +687,7 @@ mod tests {
         empty_listing_mock(&server);
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 2);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         // enqueue() must return immediately — not block until the worker finishes.
         let start = std::time::Instant::now();
@@ -524,7 +706,7 @@ mod tests {
         empty_listing_mock(&server);
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 4);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result =
             qm.enqueue_and_wait(TaskKey::FetchDir("hi-dir".to_string()), Priority::High);
@@ -537,7 +719,7 @@ mod tests {
         empty_listing_mock(&server);
 
         let obj = Arc::new(ObjectManager::new());
-        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server), 4);
+        let qm = QueueManager::new(Arc::clone(&obj), mock_client(&server));
 
         let result =
             qm.enqueue_and_wait(TaskKey::FetchDir("lo-dir".to_string()), Priority::Low);

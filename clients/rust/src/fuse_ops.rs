@@ -20,9 +20,10 @@
 use crate::dup_mapping::DupMapping;
 use crate::gclient::FileInfo;
 use crate::object_manager::{
-    ObjectManager, ROOT_INO, SMALL_FILE_MAX_BYTES, TTL, desktop_content, is_workspace_type,
+    CACHE_MAX_FILE_BYTES, ObjectManager, PREFETCH_MAX_BYTES, ROOT_INO, TTL, desktop_content,
+    is_workspace_type,
 };
-use crate::queue_manager::{Priority, QueueManager, TaskKey};
+use crate::queue_manager::{Priority, QueueManager, TaskKey, TaskResult};
 use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, Request};
 use log::{debug, error, info};
 use std::ffi::OsStr;
@@ -52,6 +53,8 @@ impl GDriveFuse {
             std::thread::Builder::new()
                 .name("startup-prefetch".to_string())
                 .spawn(move || {
+                    // Use FetchDir (full, all pages) for startup so the root
+                    // listing is complete before any user interaction.
                     match q.enqueue_and_wait(
                         TaskKey::FetchDir("root".to_string()),
                         Priority::Normal,
@@ -66,7 +69,7 @@ impl GDriveFuse {
                                         && !f.mime_type
                                             .starts_with("application/vnd.google-apps.")
                                         && f.size > 0
-                                        && f.size <= SMALL_FILE_MAX_BYTES
+                                        && f.size <= PREFETCH_MAX_BYTES
                                 })
                                 .count();
                             info!(
@@ -80,13 +83,14 @@ impl GDriveFuse {
                             for f in files.iter().filter(|f| f.is_folder) {
                                 q.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::Normal);
                             }
-                            // Pre-download small files so background readers are instant.
+                            // Pre-download files ≤ PREFETCH_MAX_BYTES (64 KiB) on Low
+                            // priority — served by the 24 dedicated small-file workers.
                             for f in files.iter().filter(|f| {
                                 !f.is_folder
                                     && !f.mime_type
                                         .starts_with("application/vnd.google-apps.")
                                     && f.size > 0
-                                    && f.size <= SMALL_FILE_MAX_BYTES
+                                    && f.size <= PREFETCH_MAX_BYTES
                             }) {
                                 q.enqueue(TaskKey::DownloadFile(f.id.clone()), Priority::Low);
                             }
@@ -102,23 +106,64 @@ impl GDriveFuse {
     // ── Directory helper ──────────────────────────────────────────────────
 
     /// Return a fresh directory listing, fetching via the queue if the cache is
-    /// missing or expired.  After every cold fetch, child directories that are
-    /// not yet cached are enqueued for background prefetch (Low priority).
+    /// missing or expired.
+    ///
+    /// **Progressive strategy**: on a cold miss, only the first page is awaited
+    /// (fast, typically < 200 ms).  If more pages exist, a `FetchDirPages`
+    /// continuation is enqueued at Low priority so the partial listing is
+    /// available to `readdir` immediately.  Subsequent `readdir` calls
+    /// (triggered by the file manager's periodic refresh or next `opendir`)
+    /// will see a growing listing until `is_complete` is true.
+    ///
+    /// After every fetch, child directories not yet cached are enqueued for
+    /// background prefetch at Low priority.
     fn get_dir(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
-        // Fast path — entry still within TTL.
+        // Fast path 1 — entry still within TTL (partial or complete).
         if let Some(files) = self.obj.get_cached_dir(parent_id) {
             return Some(files);
         }
 
-        // Stale or missing — enqueue a fetch and block until the worker delivers.
-        if let Err(e) =
-            self.queue.enqueue_and_wait(TaskKey::FetchDir(parent_id.to_string()), Priority::High)
-        {
-            error!("get_dir '{}': {}", parent_id, e);
-            return None;
+        // Fast path 2 — stale entry: serve immediately and fire a background
+        // ETag revalidation (stale-while-revalidate).  The listing will be
+        // refreshed for the next readdir cycle without blocking the user.
+        if let Some(files) = self.obj.get_dir_files(parent_id) {
+            self.queue
+                .enqueue(TaskKey::FetchDir(parent_id.to_string()), Priority::Normal);
+            // Prefetch child dirs that are not yet cached.
+            for f in files.iter().filter(|f| f.is_folder) {
+                if !self.obj.has_cache_entry(&f.id) {
+                    self.queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::Low);
+                }
+            }
+            return Some(files);
         }
 
-        // Re-read regardless of TTL — the worker just stored a fresh result.
+        // Complete miss — fetch the first page and block until it arrives.
+        match self
+            .queue
+            .enqueue_and_wait(TaskKey::FetchDirFirstPage(parent_id.to_string()), Priority::High)
+        {
+            Ok(TaskResult::DirListingPartial(Some((page_token, etag)))) => {
+                // More pages exist — enqueue the continuation at Low priority.
+                // fuse_ops owns the queue Arc so we can enqueue directly here.
+                self.queue.enqueue(
+                    TaskKey::FetchDirPages(parent_id.to_string(), page_token, etag),
+                    Priority::Low,
+                );
+            }
+            Ok(TaskResult::DirListing) | Ok(TaskResult::DirListingPartial(None)) => {
+                // Single-page or already complete — nothing more to do.
+            }
+            Err(e) => {
+                error!("get_dir '{}': {}", parent_id, e);
+                return None;
+            }
+            Ok(other) => {
+                error!("get_dir '{}': unexpected task result {:?}", parent_id, other);
+            }
+        }
+
+        // Re-read regardless of TTL — the worker just stored a (partial) result.
         let files = self.obj.get_dir_files(parent_id)?;
 
         // Fire background prefetch for child dirs not yet in cache.
@@ -158,6 +203,43 @@ impl GDriveFuse {
 // ── Filesystem trait ───────────────────────────────────────────────────────
 
 impl Filesystem for GDriveFuse {
+    // ── opendir ────────────────────────────────────────────────────────────
+
+    /// Trigger an eager directory fetch so that the subsequent `readdir` can
+    /// return at least the first page immediately.
+    ///
+    /// We use `opendir` as the prefetch trigger rather than `readdir` because
+    /// `opendir` is called **before** the GUI shows the busy indicator and
+    /// before any `readdir` calls.  This gives the first-page fetch a head
+    /// start: by the time `readdir` arrives, there is a good chance the partial
+    /// listing is already in cache.
+    ///
+    /// The busy indicator remains visible because `readdir` still blocks on
+    /// the queue if the cache is not yet warm (< first page arrived).
+    fn opendir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
+        debug!("opendir ino={}", ino);
+        if let Some(parent_id) = self.obj.ino_to_drive_id(ino) {
+            if !self.obj.has_cache_entry(&parent_id) {
+                // Cold miss — start eager first-page fetch before readdir arrives.
+                self.queue
+                    .enqueue(TaskKey::FetchDirFirstPage(parent_id), Priority::High);
+            } else if self.obj.get_cached_dir(&parent_id).is_none() {
+                // Stale entry — trigger background ETag revalidation.
+                // readdir will serve the stale data immediately; once the
+                // worker finishes the cache becomes fresh for the next cycle.
+                self.queue.enqueue(TaskKey::FetchDir(parent_id), Priority::Normal);
+            }
+            // Fresh — nothing to do.
+        }
+        reply.opened(0, 0);
+    }
+
     // ── lookup ─────────────────────────────────────────────────────────────
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
@@ -264,8 +346,14 @@ impl Filesystem for GDriveFuse {
         }
 
         let total = entries.len().saturating_sub(2);
+        let is_complete = self.obj.is_dir_complete(&parent_id);
         if offset == 0 {
-            info!("readdir: {} entries in folder id={}", total, parent_id);
+            info!(
+                "readdir: {} entries in folder id={} ({})",
+                total,
+                parent_id,
+                if is_complete { "complete" } else { "partial \u{2014} more pages loading" }
+            );
         }
 
         let mut added = 0usize;
@@ -332,25 +420,88 @@ impl Filesystem for GDriveFuse {
             return;
         }
 
-        // Cache miss — download via queue and block.
-        if let Err(e) =
-            self.queue.enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
-        {
-            error!("read ino={}: {}", ino, e);
-            reply.error(libc::EIO);
-            return;
-        }
+        // Cache miss — strategy depends on file size:
+        //   ≤ CACHE_MAX_FILE_BYTES (1 MiB) → download fully and cache (fast repeat reads)
+        //   > CACHE_MAX_FILE_BYTES          → HTTP Range request for exactly the requested
+        //     window (no heap allocation for the whole file, no cache pollution)
+        let file_size = self
+            .obj
+            .get_metadata(&file_id)
+            .map(|f| f.size)
+            .unwrap_or(u64::MAX);
 
-        match self.obj.get_content(&file_id) {
-            Some(content) => {
-                let start = (offset as usize).min(content.len());
-                let end = (start + size as usize).min(content.len());
-                reply.data(&content[start..end]);
-            }
-            None => {
-                error!("read ino={}: content missing after download", ino);
+        if file_size <= CACHE_MAX_FILE_BYTES {
+            if let Err(e) =
+                self.queue.enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
+            {
+                error!("read ino={}: {}", ino, e);
                 reply.error(libc::EIO);
+                return;
             }
+            match self.obj.get_content(&file_id) {
+                Some(content) => {
+                    let start = (offset as usize).min(content.len());
+                    let end = (start + size as usize).min(content.len());
+                    reply.data(&content[start..end]);
+                }
+                None => {
+                    error!("read ino={}: content missing after download", ino);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else {
+            // Large file — fetch only the requested range.
+            debug!(
+                "read ino={} range offset={} size={} (file_size={})",
+                ino, offset, size, file_size
+            );
+            match self.queue.enqueue_and_wait(
+                TaskKey::DownloadFileRange(file_id.clone(), offset as u64, size),
+                Priority::High,
+            ) {
+                Ok(TaskResult::FileContentRange(bytes)) => reply.data(&bytes),
+                Ok(other) => {
+                    error!("read ino={}: unexpected task result {:?}", ino, other);
+                    reply.error(libc::EIO);
+                }
+                Err(e) => {
+                    error!("read ino={} range: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
+        }
+    }
+
+    /// Return ENODATA for every extended attribute.
+    ///
+    /// This filesystem stores no xattrs.  Returning ENODATA (= ENOATTR on
+    /// Linux) is the correct POSIX response and short-circuits any xattr
+    /// probing done by thumbnailers or indexers before they fall back to
+    /// reading the file content.
+    fn getxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _name: &std::ffi::OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        reply.error(libc::ENODATA);
+    }
+
+    /// Return an empty xattr list — there are no extended attributes here.
+    fn listxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        if size == 0 {
+            // Caller is querying the required buffer size.
+            reply.size(0);
+        } else {
+            reply.data(&[]);
         }
     }
 }

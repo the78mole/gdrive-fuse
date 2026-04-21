@@ -1,0 +1,290 @@
+---
+sidebar: de
+---
+
+# Benutzung {#sec-usage}
+
+[🇬🇧 Read in English](../en/usage.html){.btn .btn-sm .btn-outline-secondary style="float:right"}
+
+Dieses Kapitel beschreibt Installation, Konfiguration und den täglichen Betrieb
+von gdrive-fuse.
+
+## Installation & Build {#sec-usage-install}
+
+### Systemvoraussetzungen
+
+::: {.panel-tabset}
+
+#### Ubuntu / Debian
+
+```bash
+sudo apt-get install \
+  build-essential cmake pkg-config \
+  libfuse3-dev libssl-dev \
+  rustup
+```
+
+#### Fedora / RHEL
+
+```bash
+sudo dnf install \
+  gcc-c++ cmake pkgconfig \
+  fuse3-devel openssl-devel \
+  rust cargo
+```
+
+#### Arch Linux
+
+```bash
+sudo pacman -S base-devel cmake fuse3 openssl rust
+```
+
+:::
+
+Mindestversionen:
+
+| Komponente | Minimum |
+|---|---|
+| CMake | ≥ 3.20 |
+| GCC / Clang | ≥ 12 / ≥ 15 (C++20) |
+| Rust | ≥ 1.75 (Edition 2021) |
+| libfuse3 | ≥ 3.10 |
+| OpenSSL | ≥ 1.1 |
+
+### Quellcode beziehen
+
+```bash
+git clone https://github.com/the78mole/gdrive-fuse.git
+cd gdrive-fuse
+```
+
+### Bauen
+
+Das Top-Level-`Makefile` delegiert an die jeweiligen Build-Systeme:
+
+| Befehl | Wirkung |
+|---|---|
+| `make build` | Debug-Build aller Clients |
+| `make build-cpp` | Nur C++ (CMake Debug) |
+| `make build-rust` | Nur Rust (`cargo build`) |
+| `make build-release` | Release-Build aller Clients |
+| `make format` | `clang-format` + `cargo fmt` |
+| `make lint` | `clang-tidy` + `cargo clippy` |
+
+```bash
+# Empfohlener erster Build:
+make build
+```
+
+Beim ersten Durchlauf lädt CMake automatisch alle C++-Abhängigkeiten
+(`nlohmann/json`, `spdlog`, `cpr`) über `FetchContent` herunter.
+
+## Google Cloud Zugangsdaten
+
+### Projekt anlegen
+
+1. [Google Cloud Console](https://console.cloud.google.com/) öffnen.
+2. Neues Projekt anlegen oder ein vorhandenes auswählen.
+3. **APIs & Dienste → Bibliothek** → *Google Drive API* aktivieren.
+4. **APIs & Dienste → Anmeldedaten** → *Anmeldedaten erstellen* →
+   *OAuth-Client-ID*.
+5. Anwendungstyp: **Desktop-Anwendung**.
+6. Die JSON-Datei herunterladen und als `credentials.json` im Projektverzeichnis
+   ablegen.
+
+::: {.callout-warning}
+`credentials.json` und `.gdrive_tokens.json` stehen in `.gitignore` und
+dürfen **niemals** ins Repository eingecheckt werden.
+:::
+
+### Werte auslesen
+
+```bash
+# Client-ID und Client-Secret aus credentials.json lesen:
+CLIENT_ID=$(jq -r '.installed.client_id' credentials.json)
+CLIENT_SECRET=$(jq -r '.installed.client_secret' credentials.json)
+```
+
+Alternativ können die Werte als Umgebungsvariablen gesetzt werden (Rust-Client):
+
+```bash
+export CLIENT_ID=<ihre-client-id>
+export CLIENT_SECRET=<ihr-client-secret>
+```
+
+## FUSE-Gruppe einrichten
+
+Damit ein normaler Nutzer FUSE-Dateisysteme mounten darf:
+
+```bash
+# Nutzer zur fuse-Gruppe hinzufügen (einmalig):
+sudo usermod -aG fuse $USER
+# Sitzung neu starten oder:
+newgrp fuse
+```
+
+Für `allow_other`-Unterstützung (andere Nutzer sehen das Dateisystem):
+
+```bash
+# /etc/fuse.conf anpassen:
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+```
+
+## Einhängen (Mount)
+
+### C++-Client
+
+```bash
+# Einhängepunkt erstellen:
+mkdir -p ~/mnt/gdrive-fuse
+
+# Manuell starten:
+./clients/cpp/build/gdrive-fuse \
+  --client-id "$CLIENT_ID" \
+  --client-secret "$CLIENT_SECRET" \
+  ~/mnt/gdrive-fuse
+
+# Über Make:
+make run-cpp
+```
+
+Beim ersten Start öffnet sich ein Browser-Fenster für die OAuth2-Autorisierung.
+Der Token wird in `~/.gdrive_tokens.json` gespeichert und bei späteren Starts
+automatisch wiederverwendet.
+
+### Rust-Client
+
+```bash
+./clients/rust/target/debug/gdrive-fuse-rs \
+  --client-id "$CLIENT_ID" \
+  --client-secret "$CLIENT_SECRET" \
+  ~/mnt/gdrive-fuse
+
+# Oder mit Umgebungsvariablen:
+make run-rust
+```
+
+### Kommandozeilenoptionen
+
+::: {.panel-tabset}
+
+#### C++-Client
+
+```
+Usage: gdrive-fuse [options] <mountpoint>
+
+Optionen:
+  --client-id <id>         OAuth2 Client-ID (erforderlich)
+  --client-secret <secret> OAuth2 Client-Secret (erforderlich)
+  --debug                  Debug-Logging aktivieren
+  --help                   Hilfe anzeigen
+
+FUSE-Optionen können nach dem Einhängepunkt angegeben werden.
+```
+
+#### Rust-Client
+
+```
+Usage: gdrive-fuse-rs [OPTIONS] <MOUNTPOINT>
+
+Arguments:
+  <MOUNTPOINT>  Einhängepunkt-Verzeichnis
+
+Options:
+      --client-id <CLIENT_ID>         OAuth2 Client-ID [env: CLIENT_ID]
+      --client-secret <CLIENT_SECRET> OAuth2 Client-Secret [env: CLIENT_SECRET]
+  -d, --debug                         Debug-Logging aktivieren
+  -h, --help                          Hilfe anzeigen
+  -V, --version                       Versionsnummer anzeigen
+```
+
+:::
+
+## Normaler Betrieb
+
+Nach erfolgreichem Mount ist Google Drive als gewöhnliches Verzeichnis nutzbar:
+
+```bash
+# Inhalte anzeigen:
+ls ~/mnt/gdrive-fuse
+
+# Datei lesen:
+cat ~/mnt/gdrive-fuse/dokument.txt
+
+# Datei kopieren (von Drive auf lokale Disk):
+cp ~/mnt/gdrive-fuse/bericht.pdf ~/Downloads/
+
+# Datei hochladen:
+cp ~/Downloads/neue-datei.xlsx ~/mnt/gdrive-fuse/
+
+# Datei löschen:
+rm ~/mnt/gdrive-fuse/alte-datei.txt
+```
+
+::: {.callout-note}
+Google-Docs-Dokumente (`.gdoc`, `.gsheet`, …) sind als Shortcut-Dateien
+sichtbar, die einen Link auf die Web-Oberfläche enthalten. Sie können nicht
+direkt bearbeitet werden.
+:::
+
+## Aushängen (Unmount)
+
+```bash
+# Über Make:
+make stop
+
+# Manuell:
+fusermount3 -u ~/mnt/gdrive-fuse
+```
+
+## Leistungs-Benchmarks
+
+Das Repository enthält ein Benchmark-Skript, das C++- und Rust-Client
+vergleicht (erfordert [hyperfine](https://github.com/sharkdp/hyperfine)):
+
+```bash
+make bench
+# oder direkt:
+bash benchmarks/run.sh
+```
+
+## Troubleshooting
+
+### „Transport endpoint is not connected"
+
+Das Dateisystem ist nicht korrekt ausgehängt. Aushängen erzwingen:
+
+```bash
+fusermount3 -uz ~/mnt/gdrive-fuse
+```
+
+### „fuse: device not found" / Permission denied
+
+Die FUSE-Gruppe fehlt oder `fuse.ko` ist nicht geladen:
+
+```bash
+# Modul laden:
+sudo modprobe fuse
+
+# Gruppe prüfen:
+groups $USER | grep fuse
+```
+
+### Token abgelaufen / „invalid_grant"
+
+Die gespeicherten Tokens löschen und die Authentifizierung erneut starten:
+
+```bash
+rm ~/.gdrive_tokens.json
+# Client neu starten
+```
+
+### Debug-Logging aktivieren
+
+```bash
+# C++:
+./gdrive-fuse --debug --client-id ... --client-secret ... ~/mnt/gdrive-fuse
+
+# Rust:
+RUST_LOG=debug ./gdrive-fuse-rs ...
+```

@@ -1,0 +1,24 @@
+---
+title: "gdrive-fuse"
+sidebar: false
+---
+
+## gdrive-fuse Documentation
+
+Mount Google Drive as a local FUSE filesystem on Linux.
+
+::: {.grid}
+
+::: {.g-col-6}
+### 🇩🇪 Deutsch
+
+[Zum deutschen Handbuch →](de/index.html){.btn .btn-primary}
+:::
+
+::: {.g-col-6}
+### 🇬🇧 English
+
+[Read the English manual →](en/index.html){.btn .btn-primary}
+:::
+
+:::

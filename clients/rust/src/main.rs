@@ -57,7 +57,7 @@ fn main() -> Result<()> {
 
     // Build FUSE filesystem handler
     let obj = std::sync::Arc::new(object_manager::ObjectManager::new());
-    let queue = queue_manager::QueueManager::new(Arc::clone(&obj), Arc::clone(&client), 16);
+    let queue = queue_manager::QueueManager::new(Arc::clone(&obj), Arc::clone(&client));
 
     // Persistent duplicate-name mapping.
     let dup_map_path = std::env::var("HOME")

@@ -5,7 +5,7 @@
 
 use crate::auth::Auth;
 use anyhow::Result;
-use log::{debug, error};
+use log::{debug, error, info};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -39,9 +39,19 @@ pub struct DirListing {
 #[derive(Clone)]
 pub enum ApiOutcome {
     DirListing(DirListing),
+    /// First page of a directory listing.  `next_page_token` is `Some` when
+    /// there are additional pages to fetch.
+    DirListingFirstPage {
+        files: Vec<FileInfo>,
+        next_page_token: Option<String>,
+        etag: String,
+    },
     NotModified,
     FileMetadata(FileInfo),
     FileContent(Vec<u8>),
+    /// Result of a Range request — bytes are returned directly to the caller
+    /// and are NOT stored in the content cache.
+    FileContentRange(Vec<u8>),
 }
 
 /// Google Drive API wrapper — thread-safe through `Arc<Auth>`.
@@ -146,6 +156,96 @@ impl GClient {
         Ok(DirListing { files: all_files, etag })
     }
 
+    /// Fetch only the **first page** of a directory listing (10 entries).
+    ///
+    /// Uses a small `pageSize=10` so the first results appear in the GUI
+    /// file explorer with minimal latency.  Returns
+    /// `(first_page_files, next_page_token, etag)`.  When
+    /// `next_page_token` is `Some`, the caller should continue with
+    /// [`list_files_pages`] to retrieve the remaining files.  This allows
+    /// FUSE `readdir` to return partial results immediately while background
+    /// workers fetch the rest.
+    pub fn list_files_first_page(
+        &self,
+        parent_id: &str,
+    ) -> Result<(Vec<FileInfo>, Option<String>, String)> {
+        let token = self.get_token()?;
+        let query = format!("'{}' in parents and trashed = false", parent_id);
+        let url = format!(
+            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)&pageSize=10",
+            self.base_url,
+            urlencoding::encode(&query)
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()?
+            .error_for_status()?;
+
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body: serde_json::Value = resp.json()?;
+        let files = parse_file_list(&body);
+        let next = body["nextPageToken"].as_str().map(|s| s.to_string());
+
+        debug!(
+            "list_files_first_page('{}'): {} files, has_more={}",
+            parent_id,
+            files.len(),
+            next.is_some()
+        );
+        Ok((files, next, etag))
+    }
+
+    /// Fetch all remaining pages of a directory listing starting from
+    /// `page_token`.  Appends to `accumulator` and returns the final merged
+    /// `DirListing`.
+    pub fn list_files_pages(
+        &self,
+        parent_id: &str,
+        mut page_token: String,
+        mut accumulator: Vec<FileInfo>,
+        etag: String,
+    ) -> Result<DirListing> {
+        let token = self.get_token()?;
+        let query = format!("'{}' in parents and trashed = false", parent_id);
+        let base_url = format!(
+            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)&pageSize=1000",
+            self.base_url,
+            urlencoding::encode(&query)
+        );
+
+        loop {
+            let url = format!("{}&pageToken={}", base_url, urlencoding::encode(&page_token));
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()?
+                .error_for_status()?;
+            let body: serde_json::Value = resp.json()?;
+            accumulator.extend(parse_file_list(&body));
+            match body["nextPageToken"].as_str() {
+                Some(pt) => page_token = pt.to_string(),
+                None => break,
+            }
+        }
+
+        debug!(
+            "list_files_pages('{}'): {} files total (all remaining pages)",
+            parent_id,
+            accumulator.len()
+        );
+        Ok(DirListing { files: accumulator, etag })
+    }
+
     /// Conditional GET with If-None-Match. Returns `None` on 304.
     /// Mirrors `GClient::revalidateDir()`.
     ///
@@ -241,6 +341,44 @@ impl GClient {
 
         let bytes = resp.bytes()?.to_vec();
         debug!("download_file('{}'): {} bytes", file_id, bytes.len());
+        Ok(bytes)
+    }
+
+    /// Download a byte range of a file using an HTTP `Range` request.
+    ///
+    /// Used for files larger than `SMALL_FILE_MAX_BYTES` so that `fuse_ops::read`
+    /// serves exactly the bytes requested by the kernel without fetching and
+    /// caching the entire file.  Returns the bytes actually received, which may
+    /// be shorter than `length` at end-of-file (206 Partial Content) or equal
+    /// to the full file when the server ignores the Range header (200 OK).
+    pub fn download_file_range(
+        &self,
+        file_id: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>> {
+        let token = self.get_token()?;
+        let url = format!("{}/files/{}?alt=media", self.base_url, file_id);
+        // RFC 7233 byte-range: "bytes=<first>-<last>" — both endpoints inclusive.
+        let last = offset.saturating_add(length as u64).saturating_sub(1);
+        let range_header = format!("bytes={}-{}", offset, last);
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .header("Range", &range_header)
+            .send()?
+            .error_for_status()?;
+
+        let bytes = resp.bytes()?.to_vec();
+        info!(
+            "download_file_range('{}', {}..={}): {} bytes",
+            file_id,
+            offset,
+            last,
+            bytes.len()
+        );
         Ok(bytes)
     }
 }

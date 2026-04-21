@@ -1,0 +1,50 @@
+---
+sidebar: en
+---
+
+# Introduction {.unnumbered}
+
+[🇩🇪 Auf Deutsch lesen](../de/index.html){.btn .btn-sm .btn-outline-secondary style="float:right"}
+
+**gdrive-fuse** mounts a Google Drive account as a local filesystem on Linux.
+The kernel communicates through the FUSE3 interface — no root privileges required.
+
+The project is a multi-language monorepo with two complete, functionally
+equivalent implementations:
+
+| Client | Language | Standard | Notes |
+|---|---|---|---|
+| `clients/cpp` | C++20 | C++20 | Reference implementation |
+| `clients/rust` | Rust 2021 | Edition 2021 | Production-ready, LRU cache |
+
+Both clients implement:
+
+- Google Drive REST API v3 (list, download, upload, delete)
+- OAuth2 Authorization Code Flow with automatic token refresh
+- ETag-based 3-state directory cache (`FRESH → STALE → INVALID`)
+- File content cache with size limits
+- Fine-grained concurrency locking
+- Background change-watcher (Drive Changes API)
+
+## Project Structure
+
+```
+gdrive-fuse/
+├── clients/
+│   ├── cpp/          # C++20 implementation (CMake)
+│   └── rust/         # Rust implementation (Cargo)
+├── benchmarks/
+│   └── run.sh        # Performance comparison (hyperfine)
+├── docs/
+│   ├── BUILD.md      # Build guide
+│   └── manual/       # This manual (Quarto)
+└── Makefile          # Top-level, delegates to clients
+```
+
+## Requirements at a Glance
+
+- Linux with FUSE3 (`libfuse3 ≥ 3.10`)
+- Google Cloud OAuth2 credentials (`credentials.json`)
+- Membership in the `fuse` group (or `user_allow_other` in `/etc/fuse.conf`)
+
+Detailed installation instructions are in the [Usage](usage.html#sec-en-usage-install) chapter.

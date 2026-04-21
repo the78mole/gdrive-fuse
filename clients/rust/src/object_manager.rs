@@ -18,7 +18,9 @@
 use crate::gclient::{DirListing, FileInfo};
 use dashmap::DashMap;
 use fuser::{FileAttr, FileType};
-use log::debug;
+use log::{debug, info};
+use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,14 +29,104 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const TTL: Duration = Duration::from_secs(30);
 pub const ROOT_INO: u64 = 1;
 
-/// Maximum number of file contents held in `content_cache`.
-pub const FILE_CACHE_MAX: usize = 64;
+/// Files at or below this size are enqueued for **proactive prefetch** by the
+/// dedicated small-file worker pool.  Does not affect what gets cached —
+/// see `CACHE_MAX_FILE_BYTES` for that.
+pub const PREFETCH_MAX_BYTES: u64 = 512 * 1024; // 64 KiB
 
-/// Regular files at or below this threshold are downloaded proactively so
-/// reads by background services (e.g. gvfsd-trash) are served from cache.
-pub const SMALL_FILE_MAX_BYTES: u64 = 64 * 1024; // 64 KiB
+/// Files at or below this size are fully downloaded into the in-memory content
+/// cache on first read.  Larger files are served via HTTP Range requests and
+/// are not stored in the content cache.
+pub const CACHE_MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
-// ── Cache state machine ────────────────────────────────────────────────────
+/// Maximum total byte footprint of the in-memory content cache.
+/// Least-recently-used entries are evicted once this limit is exceeded.
+pub const CACHE_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+// ── ContentCache — byte-bounded LRU ─────────────────────────────────────
+
+/// Thread-safe in-memory content cache with byte-granularity FIFO eviction.
+///
+/// Entries are evicted in insertion order (FIFO) once the total stored bytes
+/// exceed `max_bytes`.  A single mutex protects both the map and the running
+/// byte counter so all operations are atomic.
+pub struct ContentCache {
+    inner: Mutex<ContentCacheInner>,
+    max_bytes: u64,
+}
+
+struct ContentCacheInner {
+    map: HashMap<String, Vec<u8>>,
+    /// Insertion order used for eviction (FIFO).
+    order: VecDeque<String>,
+    total_bytes: u64,
+}
+
+impl ContentCache {
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            inner: Mutex::new(ContentCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                total_bytes: 0,
+            }),
+            max_bytes,
+        }
+    }
+
+    /// Look up a cached entry.
+    pub fn get(&self, file_id: &str) -> Option<Vec<u8>> {
+        self.inner.lock().map.get(file_id).cloned()
+    }
+
+    /// Insert or replace an entry, evicting oldest entries as needed.
+    pub fn insert(&self, file_id: &str, data: Vec<u8>) {
+        let new_size = data.len() as u64;
+        let mut inner = self.inner.lock();
+
+        // Refund the size of an existing entry that will be replaced.
+        if let Some(old) = inner.map.remove(file_id) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(old.len() as u64);
+            // Remove stale entry from the ordering queue.
+            inner.order.retain(|k| k != file_id);
+        }
+
+        // Evict oldest entries until there is room for the new one.
+        while self.max_bytes > 0 && inner.total_bytes + new_size > self.max_bytes {
+            match inner.order.pop_front() {
+                Some(evict_id) => {
+                    if let Some(evicted) = inner.map.remove(&evict_id) {
+                        let freed = evicted.len() as u64;
+                        inner.total_bytes = inner.total_bytes.saturating_sub(freed);
+                        info!("content-cache: evicted '{}' ({} bytes), total now {} bytes",
+                            evict_id, freed, inner.total_bytes);
+                    }
+                }
+                None => break, // cache is empty but new entry is still too big
+            }
+        }
+
+        inner.total_bytes += new_size;
+        inner.order.push_back(file_id.to_string());
+        inner.map.insert(file_id.to_string(), data);
+        debug!("content-cache: stored '{}' ({} bytes), total {} bytes",
+            file_id, new_size, inner.total_bytes);
+    }
+
+    /// Number of entries currently in the cache (for testing).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().map.len()
+    }
+
+    /// Total bytes currently stored in the cache.
+    #[cfg(test)]
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.lock().total_bytes
+    }
+}
+
+
 
 #[derive(Clone, PartialEq)]
 pub enum DirCacheState {
@@ -52,6 +144,11 @@ pub struct DirEntry {
     pub etag: String,
     pub fetched_at: std::time::Instant,
     pub state: DirCacheState,
+    /// `false` while background workers are still fetching additional pages.
+    /// FUSE `readdir` may serve a partial listing immediately; the kernel will
+    /// ask again (via a new `opendir`/`readdir` cycle) and see the full result
+    /// once this flag is `true`.
+    pub is_complete: bool,
 }
 
 // ── ObjectManager ──────────────────────────────────────────────────────────
@@ -64,8 +161,8 @@ pub struct ObjectManager {
     pub metadata: DashMap<String, FileInfo>,
     /// Parent Drive ID → directory listing.
     pub dir_cache: DashMap<String, DirEntry>,
-    /// Drive file ID → downloaded bytes (bounded LRU by count).
-    pub content_cache: DashMap<String, Vec<u8>>,
+    /// Drive file ID → downloaded bytes (byte-bounded LRU cache).
+    pub content_cache: ContentCache,
     /// `"{parent_id}:{display_name}"` → `file_id` — populated by every dir
     /// store so `lookup` can resolve in O(1) without scanning the listing.
     pub name_index: DashMap<String, String>,
@@ -83,7 +180,7 @@ impl ObjectManager {
             id_to_ino,
             metadata: DashMap::new(),
             dir_cache: DashMap::new(),
-            content_cache: DashMap::new(),
+            content_cache: ContentCache::new(CACHE_MAX_TOTAL_BYTES),
             name_index: DashMap::new(),
         }
     }
@@ -148,6 +245,41 @@ impl ObjectManager {
 
     // ── Directory cache writes ────────────────────────────────────────────
 
+    /// Store the **first page** of a directory listing as a partial result.
+    ///
+    /// The entry is marked `is_complete = false`.  Call [`append_dir_listing`]
+    /// when all remaining pages have been fetched.
+    pub fn store_dir_partial(&self, parent_id: &str, files: Vec<FileInfo>, etag: String) {
+        for f in &files {
+            self.get_or_alloc_ino(&f.id);
+            self.metadata.insert(f.id.clone(), f.clone());
+            self.name_index
+                .insert(make_name_key(parent_id, &f.name, &f.mime_type), f.id.clone());
+        }
+        debug!(
+            "store_dir_partial('{}'): {} files (partial)",
+            parent_id,
+            files.len()
+        );
+        self.dir_cache.insert(
+            parent_id.to_string(),
+            DirEntry {
+                files,
+                etag,
+                fetched_at: std::time::Instant::now(),
+                state: DirCacheState::Fresh,
+                is_complete: false,
+            },
+        );
+    }
+
+    /// Replace the directory listing with a complete result fetched across all
+    /// pages and mark `is_complete = true`.
+    #[allow(dead_code)]
+    pub fn append_dir_listing(&self, parent_id: &str, listing: DirListing) {
+        self.store_dir_listing(parent_id, listing);
+    }
+
     /// Store a fresh directory listing and populate metadata + name index.
     pub fn store_dir_listing(&self, parent_id: &str, listing: DirListing) {
         for f in &listing.files {
@@ -169,6 +301,7 @@ impl ObjectManager {
                 etag: listing.etag,
                 fetched_at: std::time::Instant::now(),
                 state: DirCacheState::Fresh,
+                is_complete: true,
             },
         );
     }
@@ -181,7 +314,13 @@ impl ObjectManager {
         let mut entry = self.dir_cache.get_mut(parent_id)?;
         entry.fetched_at = std::time::Instant::now();
         entry.state = DirCacheState::Fresh;
+        entry.is_complete = true;
         Some(entry.files.clone())
+    }
+
+    /// Returns `true` when the cached listing is complete (all pages fetched).
+    pub fn is_dir_complete(&self, parent_id: &str) -> bool {
+        self.dir_cache.get(parent_id).map(|e| e.is_complete).unwrap_or(false)
     }
 
     // ── Metadata ─────────────────────────────────────────────────────────
@@ -198,16 +337,14 @@ impl ObjectManager {
     // ── Content cache ─────────────────────────────────────────────────────
 
     pub fn get_content(&self, file_id: &str) -> Option<Vec<u8>> {
-        self.content_cache.get(file_id).map(|r| r.clone())
+        self.content_cache.get(file_id)
     }
 
-    /// Store downloaded file content.  Evicts the entire cache when the
-    /// count-based limit is reached (simple, avoids per-entry tracking).
+    /// Store downloaded file content.  Files larger than `CACHE_MAX_FILE_BYTES`
+    /// should not be passed here — callers in `fuse_ops` already guard this.
+    /// LRU eviction happens automatically if the byte budget is exceeded.
     pub fn store_content(&self, file_id: &str, content: Vec<u8>) {
-        if self.content_cache.len() >= FILE_CACHE_MAX {
-            self.content_cache.clear();
-        }
-        self.content_cache.insert(file_id.to_string(), content);
+        self.content_cache.insert(file_id, content);
     }
 
     // ── FileAttr helpers (shared between fuse_ops and here) ───────────────
@@ -369,6 +506,7 @@ mod tests {
             etag: etag.to_string(),
             fetched_at: std::time::Instant::now() - Duration::from_secs(60),
             state: DirCacheState::Fresh,
+            is_complete: true,
         }
     }
 
@@ -550,17 +688,30 @@ mod tests {
     }
 
     #[test]
-    fn store_content_evicts_on_overflow() {
-        let obj = ObjectManager::new();
-        for i in 0..FILE_CACHE_MAX {
-            obj.store_content(&format!("f{}", i), vec![i as u8]);
-        }
-        assert_eq!(obj.content_cache.len(), FILE_CACHE_MAX);
-        // One more triggers full eviction
-        obj.store_content("overflow", vec![0xFF]);
-        // Cache is cleared then the new item is inserted → exactly 1 item
-        assert_eq!(obj.content_cache.len(), 1);
-        assert_eq!(obj.get_content("overflow"), Some(vec![0xFF]));
+    fn store_content_evicts_fifo_on_overflow() {
+        // Build a cache that holds at most 10 bytes.
+        let cache = ContentCache::new(10);
+        // Insert two entries: 4 + 4 = 8 bytes (fits).
+        cache.insert("a", vec![0u8; 4]);
+        cache.insert("b", vec![0u8; 4]);
+        assert_eq!(cache.total_bytes(), 8);
+        // Insert 5 bytes — evicts "a" (oldest, FIFO: 4 bytes freed → 4 + 5 = 9 ≤ 10).
+        cache.insert("c", vec![0u8; 5]);
+        assert!(cache.get("a").is_none(), "a should have been evicted (oldest)");
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(cache.total_bytes() <= 10);
+    }
+
+    #[test]
+    fn store_content_replace_updates_size() {
+        let cache = ContentCache::new(100);
+        cache.insert("f1", vec![0u8; 10]);
+        assert_eq!(cache.total_bytes(), 10);
+        // Replace with a smaller value — total should shrink.
+        cache.insert("f1", vec![0u8; 3]);
+        assert_eq!(cache.total_bytes(), 3);
+        assert_eq!(cache.len(), 1);
     }
 
     // ── free helpers ─────────────────────────────────────────────────────

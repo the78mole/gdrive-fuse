@@ -54,3 +54,5 @@ credentials.json
 
 # Rust build artifacts
 clients/rust/target/
+
+docs/manual/_site/

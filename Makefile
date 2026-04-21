@@ -17,7 +17,7 @@ RUST_SRC_DIR   := clients/rust
 RUST_BINARY    := $(RUST_SRC_DIR)/target/release/gdrive-fuse-rs
 RUST_BINARY_DBG:= $(RUST_SRC_DIR)/target/debug/gdrive-fuse-rs
 
-MOUNT_POINT    ?= $(HOME)/mnt/gdrive-fuse
+MOUNT_POINT    ?= $(HOME)/mnt/gdrive
 NPROC          := $(shell nproc)
 
 # C++ source files for format / lint
@@ -27,15 +27,19 @@ SRCS := $(shell find clients/cpp/src clients/cpp/include -name '*.cpp' -o -name 
 BUILD_DIR  := $(CPP_BUILD_DIR)
 BINARY     := $(CPP_BINARY)
 
-# OAuth2 credentials – override on the command line or via environment.
-CLIENT_ID     ?= $(error CLIENT_ID is not set – pass it on the command line or export it)
-CLIENT_SECRET ?= $(error CLIENT_SECRET is not set – pass it on the command line or export it)
+# OAuth2 credentials – resolved in priority order:
+#   1. Command-line argument or environment variable (CLIENT_ID / CLIENT_SECRET)
+#   2. credentials.json (if present – requires jq)
+# The _check-creds guard verifies they are non-empty before any mount/build.
+CREDENTIALS_JSON ?= credentials.json
+CLIENT_ID        ?= $(shell test -f "$(CREDENTIALS_JSON)" && jq -r '.installed.client_id'     "$(CREDENTIALS_JSON)" 2>/dev/null)
+CLIENT_SECRET    ?= $(shell test -f "$(CREDENTIALS_JSON)" && jq -r '.installed.client_secret' "$(CREDENTIALS_JSON)" 2>/dev/null)
 
 # ── Phony targets ───────────────────────────────────────────────────────────
 .PHONY: help \
         build build-cpp build-rust \
         build-release build-cpp-release build-rust-release \
-        run run-cpp run-rust \
+        run run-cpp run-rust run-rust-dbg \
         stop stop-cpp stop-rust \
         format format-cpp format-rust \
         lint lint-cpp lint-rust \
@@ -60,7 +64,8 @@ help:
 	@echo ""
 	@echo "  Mount / Unmount"
 	@echo "  run-cpp            Mount with C++ client at \$(MOUNT_POINT)"
-	@echo "  run-rust           Mount with Rust client at \$(MOUNT_POINT)"
+	@echo "  run-rust           Mount with Rust client at \$(MOUNT_POINT) (background)"
+	@echo "  run-rust-dbg       Mount with Rust client, foreground log (CTRL-C to stop)"
 	@echo "  stop               Unmount \$(MOUNT_POINT)"
 	@echo ""
 	@echo "  Code Quality"
@@ -75,7 +80,8 @@ help:
 	@echo ""
 	@echo "  bench              Performance comparison (requires hyperfine)"
 	@echo ""
-	@echo "  Options: CLIENT_ID=... CLIENT_SECRET=... MOUNT_POINT=..."
+	@echo "  Options: CLIENT_ID=... CLIENT_SECRET=... MOUNT_POINT=... CREDENTIALS_JSON=..."
+	@echo "  Credentials are auto-read from credentials.json (requires jq) if not set."
 	@echo "  ────────────────────────────────────────────────────────────────────"
 	@echo ""
 
@@ -124,25 +130,39 @@ run-rust: _check-creds $(RUST_BINARY_DBG)
 		"$(MOUNT_POINT)" &
 	@echo "[rust] Mounted at $(MOUNT_POINT) (PID $$!)"
 
-# ── stop ────────────────────────────────────────────────────────────────────
-stop: stop-cpp stop-rust
+run-rust-dbg: _check-creds $(RUST_BINARY_DBG)
+	@mkdir -p "$(MOUNT_POINT)"
+	@if grep -qs " $(MOUNT_POINT) " /proc/mounts; then \
+		echo "Already mounted – run 'make stop' first."; exit 1; \
+	fi
+	@echo "[rust] Mounting at $(MOUNT_POINT) – press CTRL-C to unmount and exit"
+	RUST_LOG=$${RUST_LOG:-info} $(RUST_BINARY_DBG) \
+		--client-id    "$(CLIENT_ID)"     \
+		--client-secret "$(CLIENT_SECRET)" \
+		"$(MOUNT_POINT)"
 
-stop-cpp:
-	@if mountpoint -q "$(MOUNT_POINT)" 2>/dev/null; then \
+# ── stop ────────────────────────────────────────────────────────────────────
+# Kill both FUSE daemons first, then unmount.  Use /proc/mounts instead of
+# `mountpoint -q` because `mountpoint -q` returns non-zero for stale FUSE
+# mounts (daemon gone, kernel entry still present).
+stop: stop-cpp stop-rust
+	@if grep -qs " $(MOUNT_POINT) " /proc/mounts; then \
 		fusermount3 -u "$(MOUNT_POINT)" && echo "Unmounted $(MOUNT_POINT)"; \
 	else \
 		echo "$(MOUNT_POINT) is not mounted."; \
 	fi
-	@pkill -f "$(CPP_BINARY)" 2>/dev/null && echo "[cpp] Process stopped." || true
+
+stop-cpp:
+	@pkill -x gdrive-fuse 2>/dev/null && echo "[cpp] Process stopped." || true
 
 stop-rust:
-	@pkill -f "gdrive-fuse-rs" 2>/dev/null && echo "[rust] Process stopped." || true
+	@pkill -x gdrive-fuse-rs 2>/dev/null && echo "[rust] Process stopped." || true
 
 # ── internal: credential guard ──────────────────────────────────────────────
 .PHONY: _check-creds
 _check-creds:
-	@test -n "$(CLIENT_ID)"     || (echo "ERROR: CLIENT_ID is not set";     exit 1)
-	@test -n "$(CLIENT_SECRET)" || (echo "ERROR: CLIENT_SECRET is not set"; exit 1)
+	@test -n "$(CLIENT_ID)"     || (echo "ERROR: CLIENT_ID is not set and could not be read from $(CREDENTIALS_JSON) (is jq installed?)";     exit 1)
+	@test -n "$(CLIENT_SECRET)" || (echo "ERROR: CLIENT_SECRET is not set and could not be read from $(CREDENTIALS_JSON) (is jq installed?)"; exit 1)
 
 # ── format ──────────────────────────────────────────────────────────────────
 format: format-cpp format-rust
