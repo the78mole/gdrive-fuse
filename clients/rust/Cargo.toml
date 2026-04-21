@@ -57,3 +57,20 @@ strip = true
 [dev-dependencies]
 httpmock = "0.8"
 tempfile = "3.27.0"
+
+[package.metadata.deb]
+name = "gdrive-fuse-rs"
+maintainer = "Daniel Glaser <me@the78mole.de>"
+copyright = "2024-2026, Daniel Glaser <me@the78mole.de>"
+license-file = ["../../LICENSE", "4"]
+extended-description = """\
+Mounts Google Drive as a local FUSE3 filesystem on Linux. \
+Implements OAuth2 Authorization Code flow with silent token refresh, \
+ETag-based 3-state directory cache, per-file content cache, \
+fine-grained concurrent locking, and a background change-watcher."""
+depends = "$auto, fuse3"
+section = "utils"
+priority = "optional"
+assets = [
+    { source = "target/release/gdrive-fuse-rs", dest = "usr/bin/", mode = "0755" },
+]

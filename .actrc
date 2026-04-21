@@ -1,0 +1,14 @@
+# act local runner configuration
+# Maps GitHub-hosted runner labels to Docker images.
+# See: https://github.com/catthehacker/docker_images
+
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+-P ubuntu-22.04=catthehacker/ubuntu:act-22.04
+-P ubuntu-24.04=catthehacker/ubuntu:act-24.04
+
+# Enable the built-in artifact server so actions/upload-artifact@v4 works locally.
+--artifact-server-path /tmp/act-artifacts
+
+# ubuntu-24.04-arm is a GitHub-hosted ARM runner — not emulatable by act
+# without QEMU. Skip arm64 builds locally with:
+#   gh act -j build-cpp --matrix deb_arch:amd64

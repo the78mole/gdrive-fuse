@@ -20,6 +20,23 @@ RUST_BINARY_DBG:= $(RUST_SRC_DIR)/target/debug/gdrive-fuse-rs
 MOUNT_POINT    ?= $(HOME)/mnt/gdrive
 NPROC          := $(shell nproc)
 
+# ── Version (local builds) ──────────────────────────────────────────────────────
+# CI sets GDRIVE_FUSE_VERSION externally; for local builds it is derived from
+# 'git describe'. Format examples:
+#   tag only:          1.2.3
+#   tag + dirty:       1.2.3-dirty
+#   commits ahead:     1.2.3-loc-42
+#   ahead + dirty:     1.2.3-loc-42-dirty
+ifeq ($(origin GDRIVE_FUSE_VERSION),undefined)
+  _GIT_DESCRIBE := $(shell git describe --tags --dirty --abbrev=7 2>/dev/null)
+  ifneq ($(_GIT_DESCRIBE),)
+    GDRIVE_FUSE_VERSION := $(shell printf '%s' '$(_GIT_DESCRIBE)' | \
+      sed -e 's|^v||' \
+          -e 's|\([0-9]*\.[0-9]*\.[0-9]*\)-\([0-9]*\)-g[0-9a-f]*|\1-loc-\2|')
+  endif
+endif
+export GDRIVE_FUSE_VERSION
+
 # C++ source files for format / lint
 SRCS := $(shell find clients/cpp/src clients/cpp/include -name '*.cpp' -o -name '*.hpp' 2>/dev/null)
 
@@ -90,7 +107,8 @@ build: build-cpp build-rust
 
 build-cpp:
 	cmake -S $(CPP_SRC_DIR) -B $(CPP_BUILD_DIR) \
-	      -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+	      -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+	      $(if $(GDRIVE_FUSE_VERSION),-DGDRIVE_FUSE_VERSION="$(GDRIVE_FUSE_VERSION)")
 	cmake --build $(CPP_BUILD_DIR) --parallel $(NPROC)
 
 build-rust:
@@ -101,7 +119,8 @@ build-release: build-cpp-release build-rust-release
 
 build-cpp-release: _check-creds
 	cmake -S $(CPP_SRC_DIR) -B $(CPP_BUILD_DIR) \
-	      -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+	      -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+	      $(if $(GDRIVE_FUSE_VERSION),-DGDRIVE_FUSE_VERSION="$(GDRIVE_FUSE_VERSION)")
 	cmake --build $(CPP_BUILD_DIR) --parallel $(NPROC)
 
 build-rust-release: _check-creds

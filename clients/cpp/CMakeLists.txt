@@ -1,6 +1,35 @@
 cmake_minimum_required(VERSION 3.20)
 project(gdrive-fuse VERSION 1.0.0 LANGUAGES CXX)
 
+# ── Version string ──────────────────────────────────────────────────────────
+# Priority: -DGDRIVE_FUSE_VERSION=<ver>  >  env GDRIVE_FUSE_VERSION  >  git describe  >  PROJECT_VERSION
+if(NOT DEFINED GDRIVE_FUSE_VERSION)
+  if(DEFINED ENV{GDRIVE_FUSE_VERSION})
+    set(GDRIVE_FUSE_VERSION "$ENV{GDRIVE_FUSE_VERSION}")
+  else()
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" describe --tags --dirty --abbrev=7
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_describe
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+    endif()
+    # v1.2.3-42-gabcdef[-dirty]  →  1.2.3-loc-42[-dirty]
+    if(_git_describe MATCHES "^v?[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-g[0-9a-f]+")
+      string(REGEX REPLACE "^v?([0-9]+\\.[0-9]+\\.[0-9]+)-([0-9]+)-g[0-9a-f]+(.*)"
+             "\\1-loc-\\2\\3" GDRIVE_FUSE_VERSION "${_git_describe}")
+    elseif(_git_describe MATCHES "^v?[0-9]+\\.[0-9]+\\.[0-9]+")
+      string(REGEX REPLACE "^v" "" GDRIVE_FUSE_VERSION "${_git_describe}")
+    else()
+      set(GDRIVE_FUSE_VERSION "${PROJECT_VERSION}")
+    endif()
+  endif()
+endif()
+message(STATUS "gdrive-fuse version: ${GDRIVE_FUSE_VERSION}")
+
 # Set C++20 standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,6 +108,11 @@ target_compile_options(gdrive-fuse PRIVATE ${FUSE3_CFLAGS_OTHER})
 
 # Link directories for FUSE
 target_link_directories(gdrive-fuse PRIVATE ${FUSE3_LIBRARY_DIRS})
+
+# Embed version string
+target_compile_definitions(gdrive-fuse PRIVATE
+    GDRIVE_FUSE_VERSION="${GDRIVE_FUSE_VERSION}"
+)
 
 # Enable warnings
 target_compile_options(gdrive-fuse PRIVATE

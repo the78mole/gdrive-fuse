@@ -14,6 +14,7 @@ void print_usage(const char* program_name) {
               << "  --client-id <id>        OAuth2 client ID (required)\n"
               << "  --client-secret <secret> OAuth2 client secret (required)\n"
               << "  --debug                 Enable debug logging\n"
+              << "  --version, -V           Print version and exit\n"
               << "  --help                  Show this help message\n"
               << "\nFUSE options can be passed after the mountpoint.\n"
               << "\nExample:\n"
@@ -37,6 +38,9 @@ int main(int argc, char* argv[]) {
 
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--version" || arg == "-V") {
+            std::cout << "gdrive-fuse-cpp " << GDRIVE_FUSE_VERSION << "\n";
             return 0;
         } else if (arg == "--client-id" && i + 1 < argc) {
             client_id = argv[++i];

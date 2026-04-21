@@ -1,0 +1,210 @@
+name: Build Debian Packages
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    paths:
+      - 'clients/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Shared version computation ─────────────────────────────────────────────
+  compute-version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.compose.outputs.full }}  # e.g. 1.2.3  or  1.2.3-pr15-3-gabcdef
+      deb:  ${{ steps.compose.outputs.deb }}   # Debian-compatible, e.g. 1.2.3  or  1.2.3~pr15.3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history required by paulhatch/semantic-version
+
+      - name: Compute semantic version
+        id: semver
+        uses: paulhatch/semantic-version@v5.4.0
+        with:
+          tag_prefix: "v"
+          # Conventional Commits: feat! / BREAKING CHANGE → major, feat → minor, rest → patch
+          major_pattern: "BREAKING CHANGE|^\\w+(\\(\\w+\\))?!:"
+          minor_pattern: "^feat(\\(\\w+\\))?:"
+          version_format: "${major}.${minor}.${patch}"
+          bump_each_commit: true
+          search_commit_body: true
+
+      - name: Compose version strings
+        id: compose
+        run: |
+          BASE="${{ steps.semver.outputs.version }}"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PR="${{ github.event.pull_request.number }}"
+            INC="${{ steps.semver.outputs.increment }}"
+            SHA=$(git rev-parse --short=7 HEAD)
+            FULL="${BASE}-pr${PR}-${INC}-g${SHA}"
+            DEB="${BASE}~pr${PR}.${INC}"
+          else
+            FULL="${BASE}"
+            DEB="${BASE}"
+          fi
+          echo "full=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "deb=${DEB}"  >> "$GITHUB_OUTPUT"
+          echo "Version: ${FULL}  (deb: ${DEB})"
+
+  # ─── C++ client ──────────────────────────────────────────────────────────────
+  build-cpp:
+    name: "C++ .deb (${{ matrix.deb_arch }})"
+    needs: compute-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config \
+            libfuse3-dev \
+            build-essential \
+            dpkg-dev
+
+      - name: Configure & build
+        working-directory: clients/cpp
+        run: |
+          cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DGDRIVE_FUSE_VERSION="${GDRIVE_FUSE_VERSION}"
+          cmake --build build -j$(nproc)
+
+      - name: Stage installation
+        working-directory: clients/cpp
+        run: |
+          mkdir -p staging/DEBIAN staging/usr/bin
+          install -m 755 build/gdrive-fuse staging/usr/bin/gdrive-fuse-cpp
+
+      - name: Generate DEBIAN/control
+        working-directory: clients/cpp
+        env:
+          DEB_VERSION: ${{ needs.compute-version.outputs.deb }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          # Auto-detect shared-library dependencies
+          DEPS=$(dpkg-shlibdeps -O staging/usr/bin/gdrive-fuse-cpp 2>/dev/null \
+                   | sed 's/shlibs:Depends=//' || true)
+          [ -z "$DEPS" ] && DEPS="fuse3, libfuse3-3"
+          {
+            echo "Package: gdrive-fuse-cpp"
+            echo "Version: ${DEB_VERSION}"
+            echo "Architecture: ${DEB_ARCH}"
+            echo "Maintainer: Daniel Glaser <me@the78mole.de>"
+            echo "Depends: ${DEPS}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Homepage: https://github.com/the78mole/gdrive-fuse"
+            echo "Description: Google Drive FUSE filesystem (C++20)"
+            echo " Mounts Google Drive as a local FUSE3 filesystem on Linux."
+            echo " Implements OAuth2, ETag-based directory caching, and"
+            echo " per-file content cache. Reference implementation."
+          } > staging/DEBIAN/control
+
+      - name: Build .deb
+        working-directory: clients/cpp
+        env:
+          DEB_VERSION: ${{ needs.compute-version.outputs.deb }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          dpkg-deb --build --root-owner-group staging \
+            "gdrive-fuse-cpp_${DEB_VERSION}_${DEB_ARCH}.deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdrive-fuse-cpp_${{ matrix.deb_arch }}
+          path: clients/cpp/gdrive-fuse-cpp_*.deb
+          if-no-files-found: error
+
+# ─── Rust client ─────────────────────────────────────────────────────────────
+  build-rust:
+    name: "Rust .deb (${{ matrix.deb_arch }})"
+    needs: compute-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev pkg-config dpkg-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/rust
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build & package .deb
+        working-directory: clients/rust
+        env:
+          DEB_VERSION: ${{ needs.compute-version.outputs.deb }}
+        run: cargo deb --deb-version "${DEB_VERSION}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdrive-fuse-rs_${{ matrix.deb_arch }}
+          path: clients/rust/target/debian/*.deb
+          if-no-files-found: error
+
+# ─── GitHub Release ───────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build-cpp, build-rust]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          merge-multiple: true
+
+      - name: List packages
+        run: find debs -name "*.deb" | sort
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: debs/*.deb
+          generate_release_notes: true
