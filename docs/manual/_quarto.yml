@@ -1,0 +1,55 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "gdrive-fuse Manual"
+  navbar:
+    left:
+      - text: "🇩🇪 Deutsch"
+        href: de/index.html
+      - text: "🇬🇧 English"
+        href: en/index.html
+    right:
+      - icon: github
+        href: https://github.com/the78mole/gdrive-fuse
+        aria-label: GitHub
+  sidebar:
+    - id: de
+      title: "gdrive-fuse Handbuch"
+      style: "docked"
+      contents:
+        - text: "Einleitung"
+          href: de/index.qmd
+        - text: "Benutzung"
+          href: de/usage.qmd
+        - text: "Architektur"
+          href: de/architecture.qmd
+        - text: "SW-Design"
+          href: de/design.qmd
+    - id: en
+      title: "gdrive-fuse Manual"
+      style: "docked"
+      contents:
+        - text: "Introduction"
+          href: en/index.qmd
+        - text: "Usage"
+          href: en/usage.qmd
+        - text: "Architecture"
+          href: en/architecture.qmd
+        - text: "SW Design"
+          href: en/design.qmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-copy: true
+    highlight-style: github
+    mermaid:
+      theme: default
+
+execute:
+  freeze: auto

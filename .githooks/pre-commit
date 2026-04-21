@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit
+# Checks that all staged C++ files are formatted according to .clang-format.
+# Aborts the commit and prints a diff if formatting issues are found.
+#
+# Install via:  make install-hooks   (or git config core.hooksPath .githooks)
+
+set -euo pipefail
+
+if ! command -v clang-format &>/dev/null; then
+    echo "  WARNING: clang-format not found – skipping format check."
+    echo "  Install it with:  sudo apt-get install clang-format"
+    exit 0
+fi
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(cpp|hpp|h|cc|cxx)$' || true)
+
+if [[ -z "$STAGED" ]]; then
+    exit 0
+fi
+
+FAILED=0
+for FILE in $STAGED; do
+    DIFF=$(clang-format --style=file "$FILE" | diff -u "$FILE" - || true)
+    if [[ -n "$DIFF" ]]; then
+        echo ""
+        echo "  ERROR: $FILE is not correctly formatted."
+        echo "$DIFF"
+        FAILED=1
+    fi
+done
+
+if [[ "$FAILED" -ne 0 ]]; then
+    echo ""
+    echo "  Run  make format  to auto-fix all formatting issues, then re-stage."
+    echo ""
+    exit 1
+fi
+
+exit 0

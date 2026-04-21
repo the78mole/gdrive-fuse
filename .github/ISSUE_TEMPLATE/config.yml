@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question in Discussions
+    url: https://github.com/the78mole/gdrive-fuse/discussions/new?category=q-a
+    about: General usage questions are better suited for Discussions than Issues

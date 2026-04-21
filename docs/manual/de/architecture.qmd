@@ -1,0 +1,267 @@
+---
+sidebar: de
+---
+
+# Architektur {#sec-architecture}
+
+[🇬🇧 Read in English](../en/architecture.html){.btn .btn-sm .btn-outline-secondary style="float:right"}
+
+Dieses Kapitel beschreibt den Systemaufbau von gdrive-fuse aus der
+Vogelperspektive: Komponentenstruktur, Datenflüsse und das Zusammenspiel
+zwischen Kernel, FUSE-Bibliothek und Google Drive API.
+
+## Systemübersicht
+
+```{mermaid}
+%%| label: fig-system-overview
+%%| fig-cap: "Systemübersicht: Kernel ↔ FUSE ↔ Google Drive"
+graph TB
+    subgraph Kernel["Linux Kernel"]
+        VFS["VFS (Virtual File System)"]
+        FUSE_K["fuse.ko (Kernel-Modul)"]
+    end
+
+    subgraph Userspace["User Space"]
+        subgraph App["Anwendung (Shell, Editor, …)"]
+            Syscall["open / read / readdir / stat …"]
+        end
+
+        subgraph Client["gdrive-fuse (C++ oder Rust)"]
+            FuseLib["FUSE3-Bibliothek<br/>(libfuse3 / fuser)"]
+            FuseOps["FuseOps<br/>(Callback-Handler)"]
+            Cache["Cache-Schicht<br/>(Dir + Content)"]
+            GClient["GClient<br/>(Drive REST API)"]
+            Auth["Auth<br/>(OAuth2)"]
+            Watcher["Change Watcher<br/>(Drive Changes API)"]
+        end
+    end
+
+    subgraph Cloud["Google Cloud"]
+        DriveAPI["Google Drive API v3"]
+        OAuth["OAuth2 Token-Endpunkt"]
+    end
+
+    Syscall -->|POSIX-Systemaufruf| VFS
+    VFS <-->|/dev/fuse| FUSE_K
+    FUSE_K <-->|Nachrichten| FuseLib
+    FuseLib --> FuseOps
+    FuseOps --> Cache
+    Cache -->|Cache-Miss| GClient
+    GClient -->|REST HTTP/2| DriveAPI
+    Auth -->|Token| GClient
+    Auth <-->|Code-Flow + Refresh| OAuth
+    Watcher -->|Invalidierung| Cache
+    Watcher <-->|Changes API| DriveAPI
+```
+
+## Komponentenbeschreibung
+
+### Auth
+
+`Auth` kapselt den vollständigen OAuth2 Authorization Code Flow für
+Desktop-Anwendungen:
+
+1. Generiert einen einmaligen *State*-Parameter (CSRF-Schutz).
+2. Öffnet die Autorisierungs-URL im Standard-Browser.
+3. Startet einen temporären HTTP-Server auf `localhost:8080` und wartet auf
+   den Callback mit dem Authorization Code.
+4. Tauscht den Code gegen Access- und Refresh-Token aus.
+5. Speichert die Tokens in `~/.gdrive_tokens.json` (verschlüsselt durch die
+   Dateisystem-Berechtigungen des Nutzers).
+6. Erneuert den Access-Token automatisch vor Ablauf mittels Refresh-Token.
+
+Der Token-Zugriff ist intern durch einen Mutex abgesichert (C++) bzw.
+`parking_lot::RwLock` (Rust).
+
+### GClient
+
+`GClient` ist ein zustandsloser HTTP-Wrapper um die Google Drive REST API v3.
+Er bietet folgende Operationen:
+
+| Methode | Drive-Endpunkt | Beschreibung |
+|---|---|---|
+| `listFiles(parent_id)` | `GET /files` | Verzeichnisinhalt abrufen |
+| `revalidateDir(id, etag)` | `GET /files` (If-None-Match) | Konditionales Abrufen |
+| `getFileMetadata(id)` | `GET /files/{id}` | Metadaten eines Eintrags |
+| `downloadFile(id)` | `GET /files/{id}?alt=media` | Dateiinhalt herunterladen |
+| `uploadFile(name, data, parent)` | `POST /upload/drive/v3/files` | Datei hochladen |
+| `deleteFile(id)` | `DELETE /files/{id}` | Datei löschen |
+| `getStartPageToken()` | `GET /changes/startPageToken` | Initialen Changes-Token |
+| `pollChanges(token)` | `GET /changes` | Änderungen abrufen |
+
+Alle Methoden sind **blockierend (synchron)**, damit keine asynchrone Laufzeit
+im FUSE-Kontext notwendig ist.
+
+### Cache-Schicht (FuseOps / ObjectManager)
+
+Der Cache ist dreischichtig:
+
+```{mermaid}
+%%| label: fig-cache-layers
+%%| fig-cap: "Drei Cache-Ebenen"
+graph LR
+    subgraph L1["Pfad-ID-Cache"]
+        P["path → Drive-ID"]
+    end
+    subgraph L2["Metadaten-Cache"]
+        M["Drive-ID → FileInfo"]
+    end
+    subgraph L3["Inhalt-Cache"]
+        C["Drive-ID → bytes<br/>(LRU, ≤ 1 GiB)"]
+    end
+    subgraph L4["Verzeichnis-Cache"]
+        D["Drive-ID → DirListing<br/>+ ETag + Zustand"]
+    end
+    FuseOps --> L1
+    L1 --> L2
+    L2 --> L3
+    L2 --> L4
+```
+
+#### Verzeichnis-Cache: 3-Zustand-Automat
+
+```{mermaid}
+%%| label: fig-cache-state
+%%| fig-cap: "Zustandsautomat des Verzeichnis-Cache"
+stateDiagram-v2
+    [*] --> INVALID : erster Zugriff / nach Schreiboperation
+    INVALID --> FRESH : listFiles() erfolgreich
+    FRESH --> STALE : TTL (30 s) abgelaufen
+    STALE --> FRESH : revalidateDir() → 304 Not Modified
+    STALE --> FRESH : revalidateDir() → 200 (neue Daten)
+    FRESH --> INVALID : Change-Watcher meldet Änderung
+    STALE --> INVALID : Change-Watcher meldet Änderung
+```
+
+### FUSE-Operationen (FuseOps / GDriveFuse)
+
+`FuseOps` (C++) bzw. `GDriveFuse` (Rust) implementiert die FUSE-Callbacks:
+
+| FUSE-Operation | Verhalten |
+|---|---|
+| `getattr` | Cache-Lookup → bei Miss: Metadaten von Drive abrufen |
+| `readdir` | Verzeichnis-Cache prüfen → FRESH: direkt; STALE: revalidieren; INVALID: neu laden |
+| `read` | Inhalt-Cache prüfen → bei Miss: herunterladen und cachen (falls ≤ 1 MiB) |
+
+Alle FUSE-Callbacks fangen Ausnahmen ab und geben POSIX-Fehlercodes zurück
+(`-ENOENT`, `-EIO`, …).
+
+### Change Watcher
+
+Der Hintergrund-Thread pollt die Drive Changes API periodisch und invalidiert
+betroffene Cache-Einträge:
+
+```{mermaid}
+%%| label: fig-watcher-flow
+%%| fig-cap: "Change-Watcher-Ablauf"
+sequenceDiagram
+    participant W as Change Watcher
+    participant G as GClient
+    participant C as Cache
+
+    W->>G: getStartPageToken()
+    G-->>W: pageToken₀
+
+    loop alle N Sekunden
+        W->>G: pollChanges(pageTokenₙ)
+        G-->>W: [ChangeList, pageTokenₙ₊₁]
+        alt Änderungen vorhanden
+            W->>C: invalidateDirCache(betroffene IDs)
+        end
+    end
+```
+
+## Nebenläufigkeitsmodell
+
+```{mermaid}
+%%| label: fig-concurrency
+%%| fig-cap: "Threading-Modell (Rust-Client)"
+graph TB
+    subgraph FUSE["FUSE-Thread (fuser)"]
+        FT["GDriveFuse::lookup<br/>GDriveFuse::readdir<br/>GDriveFuse::read<br/>…"]
+    end
+    subgraph Workers["Worker-Pool"]
+        W1["Worker 1<br/>(High-Priority)"]
+        W2["Worker 2<br/>(Normal)"]
+        W3["Worker 3–N<br/>(Low / Prefetch)"]
+    end
+    subgraph State["Gemeinsamer Zustand"]
+        OM["ObjectManager<br/>(DashMap — sharded RwLock)"]
+        QM["QueueManager<br/>(crossbeam-channel)"]
+    end
+    subgraph BG["Hintergrund-Threads"]
+        CW["Change Watcher"]
+        SP["Startup-Prefetch"]
+    end
+
+    FT -->|"enqueue_and_wait (blockierend)"| QM
+    FT -->|"Cache-Lesen"| OM
+    QM --> W1
+    QM --> W2
+    QM --> W3
+    W1 -->|"store_* Methoden"| OM
+    W2 -->|"store_* Methoden"| OM
+    W3 -->|"store_* Methoden"| OM
+    CW -->|"invalidate_dir"| OM
+    SP -->|"enqueue (fire-and-forget)"| QM
+```
+
+Im **C++-Client** übernimmt ein `std::shared_mutex` (`cache_mutex_`) die Rolle
+der DashMap-Shards: `shared_lock` für parallele Lesezugriffe,
+`unique_lock` für Schreibvorgänge. Per-File-Downloads werden über eine separate
+`file_mutexes_`-Registry serialisiert, ohne `cache_mutex_` zu halten.
+
+## Datenfluß beim Lesen einer Datei
+
+```{mermaid}
+%%| label: fig-read-flow
+%%| fig-cap: "Datenfluß: `read()`-Systemaufruf bis zum Dateiinhalt"
+sequenceDiagram
+    actor User
+    participant Kernel
+    participant FuseOps
+    participant Cache
+    participant QueueMgr
+    participant GClient
+    participant Drive as Google Drive API
+
+    User->>Kernel: read(fd, buf, n)
+    Kernel->>FuseOps: read(path, buf, n, offset)
+    FuseOps->>Cache: get_content(file_id)
+    alt Cache-Hit
+        Cache-->>FuseOps: bytes
+    else Cache-Miss
+        FuseOps->>QueueMgr: enqueue_and_wait(DownloadFile)
+        QueueMgr->>GClient: downloadFile(file_id)
+        GClient->>Drive: GET /files/{id}?alt=media
+        Drive-->>GClient: bytes
+        GClient-->>QueueMgr: bytes
+        QueueMgr->>Cache: store_content(file_id, bytes)
+        QueueMgr-->>FuseOps: TaskResult::Ok
+        FuseOps->>Cache: get_content(file_id)
+        Cache-->>FuseOps: bytes
+    end
+    FuseOps-->>Kernel: n bytes
+    Kernel-->>User: Daten
+```
+
+## Monorepo-Struktur
+
+```{mermaid}
+%%| label: fig-monorepo
+%%| fig-cap: "Monorepo-Struktur"
+graph TD
+    Root["gdrive-fuse/"]
+    Root --> Clients["clients/"]
+    Root --> Benchmarks["benchmarks/"]
+    Root --> Docs["docs/"]
+    Root --> MK["Makefile (top-level)"]
+
+    Clients --> CPP["cpp/<br/>(C++20, CMake)"]
+    Clients --> Rust["rust/<br/>(Rust 2021, Cargo)"]
+
+    CPP --> CPPSrc["src/<br/>main.cpp<br/>Auth.cpp<br/>GClient.cpp<br/>FuseOps.cpp"]
+    CPP --> CPPInc["include/gdrive_fuse/<br/>Auth.hpp<br/>GClient.hpp<br/>FuseOps.hpp"]
+
+    Rust --> RustSrc["src/<br/>main.rs<br/>auth.rs<br/>gclient.rs<br/>fuse_ops.rs<br/>object_manager.rs<br/>queue_manager.rs<br/>dup_mapping.rs"]
+```

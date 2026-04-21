@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# .githooks/commit-msg
+# Validates that the commit message follows Conventional Commits v1.0.
+# See: https://www.conventionalcommits.org/
+#
+# Install via:  make install-hooks   (or git config core.hooksPath .githooks)
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Ignore merge commits, fixup! and squash! commits
+if echo "$COMMIT_MSG" | grep -qE "^(Merge |fixup! |squash! )"; then
+    exit 0
+fi
+
+PATTERN="^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z0-9/_-]+\))?(!)?: .+"
+
+if ! echo "$COMMIT_MSG" | grep -qE "$PATTERN"; then
+    echo ""
+    echo "  ERROR: Commit message does not follow Conventional Commits."
+    echo ""
+    echo "  Expected format:"
+    echo "    <type>(<scope>): <description>"
+    echo ""
+    echo "  Valid types: feat fix docs style refactor perf test chore ci build revert"
+    echo ""
+    echo "  Examples:"
+    echo "    feat(cache): add ETag-based directory revalidation"
+    echo "    fix(gclient): parse size field as string not integer"
+    echo "    docs(build): add fuse group permission note"
+    echo ""
+    echo "  Your message was:"
+    echo "    $COMMIT_MSG" | head -1
+    echo ""
+    exit 1
+fi
+
+exit 0

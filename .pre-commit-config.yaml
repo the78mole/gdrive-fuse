@@ -1,0 +1,50 @@
+---
+# pre-commit hook configuration for gdrive-fuse
+# Install: make install-hooks
+# Run manually on all files: pre-commit run --all-files
+
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+
+repos:
+  # ── General file hygiene ─────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-merge-conflict
+      - id: check-yaml
+        args: [--unsafe]   # allows custom YAML tags (e.g. in GitHub Actions)
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=500]
+
+  # ── C++ formatting ───────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c++, c]
+        args: [--style=file]   # reads .clang-format from the repo root
+
+  # ── Conventional Commits (commit-msg hook) ───────────────────────────────
+  # Uses the project's own validation script so no external dependency is needed.
+  - repo: local
+    hooks:
+      - id: conventional-commits
+        name: Conventional Commits
+        language: script
+        entry: .githooks/commit-msg
+        stages: [commit-msg]
+
+  # ── Shell scripts (Bash / Zsh hooks) ─────────────────────────────────────
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        files: \.githooks/.*

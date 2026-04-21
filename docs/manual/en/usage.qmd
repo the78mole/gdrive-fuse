@@ -1,0 +1,288 @@
+---
+sidebar: en
+---
+
+# Usage {#sec-en-usage}
+
+[🇩🇪 Auf Deutsch lesen](../de/usage.html){.btn .btn-sm .btn-outline-secondary style="float:right"}
+
+This chapter covers installation, configuration, and daily operation of gdrive-fuse.
+
+## Installation & Build {#sec-en-usage-install}
+
+### System Requirements
+
+::: {.panel-tabset}
+
+#### Ubuntu / Debian
+
+```bash
+sudo apt-get install \
+  build-essential cmake pkg-config \
+  libfuse3-dev libssl-dev \
+  rustup
+```
+
+#### Fedora / RHEL
+
+```bash
+sudo dnf install \
+  gcc-c++ cmake pkgconfig \
+  fuse3-devel openssl-devel \
+  rust cargo
+```
+
+#### Arch Linux
+
+```bash
+sudo pacman -S base-devel cmake fuse3 openssl rust
+```
+
+:::
+
+Minimum versions:
+
+| Component | Minimum |
+|---|---|
+| CMake | ≥ 3.20 |
+| GCC / Clang | ≥ 12 / ≥ 15 (C++20) |
+| Rust | ≥ 1.75 (Edition 2021) |
+| libfuse3 | ≥ 3.10 |
+| OpenSSL | ≥ 1.1 |
+
+### Get the Source
+
+```bash
+git clone https://github.com/the78mole/gdrive-fuse.git
+cd gdrive-fuse
+```
+
+### Build
+
+The top-level `Makefile` delegates to the respective build systems:
+
+| Command | Effect |
+|---|---|
+| `make build` | Debug build for all clients |
+| `make build-cpp` | C++ only (CMake debug) |
+| `make build-rust` | Rust only (`cargo build`) |
+| `make build-release` | Release build for all clients |
+| `make format` | `clang-format` + `cargo fmt` |
+| `make lint` | `clang-tidy` + `cargo clippy` |
+
+```bash
+# Recommended first build:
+make build
+```
+
+On the first run, CMake automatically downloads all C++ dependencies
+(`nlohmann/json`, `spdlog`, `cpr`) via `FetchContent`.
+
+## Google Cloud Credentials
+
+### Create a Project
+
+1. Open the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a new project or select an existing one.
+3. **APIs & Services → Library** → enable the *Google Drive API*.
+4. **APIs & Services → Credentials** → *Create Credentials* →
+   *OAuth client ID*.
+5. Application type: **Desktop app**.
+6. Download the JSON file and save it as `credentials.json` in the project
+   directory.
+
+::: {.callout-warning}
+`credentials.json` and `.gdrive_tokens.json` are listed in `.gitignore` and
+must **never** be committed to the repository.
+:::
+
+### Extract Values
+
+```bash
+# Read client ID and secret from credentials.json:
+CLIENT_ID=$(jq -r '.installed.client_id' credentials.json)
+CLIENT_SECRET=$(jq -r '.installed.client_secret' credentials.json)
+```
+
+Alternatively, set them as environment variables (Rust client):
+
+```bash
+export CLIENT_ID=<your-client-id>
+export CLIENT_SECRET=<your-client-secret>
+```
+
+## FUSE Group Setup
+
+To allow a regular user to mount FUSE filesystems:
+
+```bash
+# Add user to fuse group (one-time):
+sudo usermod -aG fuse $USER
+# Start a new session or:
+newgrp fuse
+```
+
+For `allow_other` support (other users can see the filesystem):
+
+```bash
+# Edit /etc/fuse.conf:
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+```
+
+## Mounting
+
+### C++ Client
+
+```bash
+# Create mount point:
+mkdir -p ~/mnt/gdrive-fuse
+
+# Run manually:
+./clients/cpp/build/gdrive-fuse \
+  --client-id "$CLIENT_ID" \
+  --client-secret "$CLIENT_SECRET" \
+  ~/mnt/gdrive-fuse
+
+# Via Make:
+make run-cpp
+```
+
+On first start, a browser window opens for OAuth2 authorization.
+The token is saved to `~/.gdrive_tokens.json` and reused automatically on
+subsequent starts.
+
+### Rust Client
+
+```bash
+./clients/rust/target/debug/gdrive-fuse-rs \
+  --client-id "$CLIENT_ID" \
+  --client-secret "$CLIENT_SECRET" \
+  ~/mnt/gdrive-fuse
+
+# Or using environment variables:
+make run-rust
+```
+
+### Command-Line Options
+
+::: {.panel-tabset}
+
+#### C++ Client
+
+```
+Usage: gdrive-fuse [options] <mountpoint>
+
+Options:
+  --client-id <id>         OAuth2 client ID (required)
+  --client-secret <secret> OAuth2 client secret (required)
+  --debug                  Enable debug logging
+  --help                   Show help message
+
+FUSE options may be passed after the mountpoint.
+```
+
+#### Rust Client
+
+```
+Usage: gdrive-fuse-rs [OPTIONS] <MOUNTPOINT>
+
+Arguments:
+  <MOUNTPOINT>  Mount point directory
+
+Options:
+      --client-id <CLIENT_ID>         OAuth2 client ID [env: CLIENT_ID]
+      --client-secret <CLIENT_SECRET> OAuth2 client secret [env: CLIENT_SECRET]
+  -d, --debug                         Enable debug logging
+  -h, --help                          Print help
+  -V, --version                       Print version
+```
+
+:::
+
+## Normal Operation
+
+After a successful mount, Google Drive is accessible as an ordinary directory:
+
+```bash
+# List contents:
+ls ~/mnt/gdrive-fuse
+
+# Read a file:
+cat ~/mnt/gdrive-fuse/document.txt
+
+# Copy from Drive to local disk:
+cp ~/mnt/gdrive-fuse/report.pdf ~/Downloads/
+
+# Upload a file:
+cp ~/Downloads/new-file.xlsx ~/mnt/gdrive-fuse/
+
+# Delete a file:
+rm ~/mnt/gdrive-fuse/old-file.txt
+```
+
+::: {.callout-note}
+Google Docs files (`.gdoc`, `.gsheet`, …) appear as shortcut files containing
+a link to the web interface. They cannot be edited directly.
+:::
+
+## Unmounting
+
+```bash
+# Via Make:
+make stop
+
+# Manually:
+fusermount3 -u ~/mnt/gdrive-fuse
+```
+
+## Performance Benchmarks
+
+The repository includes a benchmark script that compares the C++ and Rust
+clients (requires [hyperfine](https://github.com/sharkdp/hyperfine)):
+
+```bash
+make bench
+# or directly:
+bash benchmarks/run.sh
+```
+
+## Troubleshooting
+
+### "Transport endpoint is not connected"
+
+The filesystem was not cleanly unmounted. Force unmount:
+
+```bash
+fusermount3 -uz ~/mnt/gdrive-fuse
+```
+
+### "fuse: device not found" / Permission denied
+
+The `fuse` group is missing or `fuse.ko` is not loaded:
+
+```bash
+# Load the module:
+sudo modprobe fuse
+
+# Check group membership:
+groups $USER | grep fuse
+```
+
+### Token expired / "invalid_grant"
+
+Delete the stored tokens and re-authenticate:
+
+```bash
+rm ~/.gdrive_tokens.json
+# Restart the client
+```
+
+### Enable Debug Logging
+
+```bash
+# C++:
+./gdrive-fuse --debug --client-id ... --client-secret ... ~/mnt/gdrive-fuse
+
+# Rust:
+RUST_LOG=debug ./gdrive-fuse-rs ...
+```

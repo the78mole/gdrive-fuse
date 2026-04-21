@@ -1,0 +1,379 @@
+---
+sidebar: de
+---
+
+# Software-Design {#sec-design}
+
+[🇬🇧 Read in English](../en/design.html){.btn .btn-sm .btn-outline-secondary style="float:right"}
+
+Dieses Kapitel beschreibt die internen Designentscheidungen, Klassenstrukturen
+und Invarianten beider Implementierungen.
+
+## Designprinzipien
+
+Das gesamte Projekt folgt einigen übergreifenden Leitprinzipien:
+
+1. **Cache-First**: Jede FUSE-Operation prüft zuerst den Cache.
+   Nur bei Miss oder abgelaufenem TTL wird die Drive API kontaktiert.
+2. **Kein Lock während HTTP**: `cache_mutex_` (C++) und DashMap-Shard-Locks
+   (Rust) werden **vor** jedem API-Aufruf freigegeben.
+3. **Keine Exceptions über FUSE-Grenzen** (C++): Alle Callbacks wickeln den
+   Rumpf in `try/catch` und geben POSIX-Fehlercodes zurück.
+4. **Kein `unsafe`** (Rust): Alle `unsafe`-Blöcke sind mit einem
+   `// SAFETY:`-Kommentar begründet.
+5. **Warnungsfreiheit**: C++ mit `-Wall -Wextra -Wpedantic -Werror`; Rust mit
+   `#![deny(warnings)]` und `cargo clippy -- -D warnings`.
+
+## C++-Implementierung
+
+### Klassendiagramm
+
+```{mermaid}
+%%| label: fig-cpp-classes
+%%| fig-cap: "C++ Klassendiagramm"
+classDiagram
+    class Auth {
+        -string client_id_
+        -string client_secret_
+        -string access_token_
+        -string refresh_token_
+        -long token_expiry_
+        -mutex mutex_
+        +Auth(client_id, client_secret)
+        +authenticate() bool
+        +getAccessToken() string
+        +isTokenValid() bool
+        +refreshToken() bool
+        -startAuthFlow() bool
+        -waitForCallback() bool
+        -exchangeCodeForTokens() bool
+        -saveTokens() void
+        -loadTokens() bool
+    }
+
+    class GClient {
+        -shared_ptr~Auth~ auth_
+        +GClient(auth)
+        +listFiles(parent_id) DirListing
+        +revalidateDir(id, etag) optional~DirListing~
+        +getFileMetadata(id) FileInfo
+        +downloadFile(id) string
+        +uploadFile(name, data, parent) string
+        +deleteFile(id) bool
+        +getStartPageToken() string
+        +pollChanges(token) ChangeList
+    }
+
+    class FuseOps {
+        -shared_ptr~GClient~ client_
+        -shared_mutex cache_mutex_
+        -unordered_map path_to_id_cache_
+        -unordered_map metadata_cache_
+        -unordered_map file_content_cache_
+        -unordered_map dir_cache_
+        -mutex file_registry_mutex_
+        -unordered_map file_mutexes_
+        -FuseOps* instance_$
+        +FuseOps(client)
+        +getFuseOperations()$ fuse_operations
+        +invalidateDirCache(parent_id) void
+        -getattr(path, stbuf, fi)$ int
+        -readdir(path, buf, filler, …)$ int
+        -read(path, buf, size, off, fi)$ int
+        +setInstance(instance)$ void
+    }
+
+    class FileInfo {
+        +string id
+        +string name
+        +string mimeType
+        +size_t size
+        +string modifiedTime
+        +bool isFolder
+    }
+
+    class DirListing {
+        +vector~FileInfo~ files
+        +string etag
+    }
+
+    Auth <-- GClient : nutzt
+    GClient <-- FuseOps : hält (shared_ptr)
+    GClient ..> FileInfo : gibt zurück
+    GClient ..> DirListing : gibt zurück
+```
+
+### Speichermodell
+
+Alle Komponenten-Instanzen werden über `std::shared_ptr` verwaltet:
+
+```{mermaid}
+%%| label: fig-cpp-ownership
+%%| fig-cap: "Speicherbesitz (C++)"
+graph LR
+    main["main()"]
+    auth["shared_ptr&lt;Auth&gt;"]
+    gclient["shared_ptr&lt;GClient&gt;"]
+    fuseops["unique_ptr&lt;FuseOps&gt;<br/>(Singleton)"]
+
+    main -->|erstellt| auth
+    main -->|erstellt| gclient
+    gclient -->|hält| auth
+    main -->|erstellt| fuseops
+    fuseops -->|hält| gclient
+    fuseops -->|FuseOps::instance_| fuseops
+```
+
+### Locking-Hierarchie (C++)
+
+```{mermaid}
+%%| label: fig-cpp-locking
+%%| fig-cap: "Locking-Hierarchie"
+graph TD
+    A["cache_mutex_ (shared_mutex)"]
+    B["file_registry_mutex_ (mutex)"]
+    C["file_mutexes_[id] (mutex)"]
+    D["Auth::mutex_ (mutex)"]
+
+    A -->|"shared_lock: getattr/readdir/read (Cache-Hit)"| ReadOp["Leseoperation"]
+    A -->|"unique_lock: Cache-Schreibzugriff"| WriteOp["Schreiboperation"]
+    B -->|"lookup / insert per-file mutex"| C
+    D -->|"getAccessToken / refreshToken"| TokenOp["Token-Operation"]
+
+    note1["Reihenfolge: cache_mutex_ IMMER vor<br/>file_mutexes_ freigeben"]
+    note2["Niemals cache_mutex_ halten<br/>während HTTP-Aufruf"]
+```
+
+::: {.callout-important}
+**Locking-Invariante**: `cache_mutex_` muss **vor** jedem HTTP-Aufruf
+freigegeben werden. Verletzungen dieser Invariante führen zu Deadlocks, wenn
+`Auth::mutex_` ebenfalls gehalten wird.
+:::
+
+### Fehlerbehandlung (C++)
+
+```cpp
+// Schema aller FUSE-Callbacks:
+static int getattr(const char* path, struct stat* stbuf,
+                   struct fuse_file_info* fi) {
+    try {
+        // … Implementierung …
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("getattr failed: {}", e.what());
+        return -EIO;
+    }
+}
+```
+
+## Rust-Implementierung
+
+### Modulstruktur
+
+```{mermaid}
+%%| label: fig-rust-modules
+%%| fig-cap: "Rust-Modulstruktur und Abhängigkeiten"
+graph TD
+    main["main.rs<br/>(Einstieg, CLI-Parsing)"]
+    auth["auth.rs<br/>(OAuth2 Flow)"]
+    gclient["gclient.rs<br/>(Drive REST API)"]
+    fuse["fuse_ops.rs<br/>(FUSE-Callbacks)"]
+    om["object_manager.rs<br/>(Cache-Zustand)"]
+    qm["queue_manager.rs<br/>(Task-Queue + Workers)"]
+    dup["dup_mapping.rs<br/>(Duplikat-Namen)"]
+
+    main --> auth
+    main --> gclient
+    main --> fuse
+    main --> om
+    main --> qm
+    main --> dup
+
+    fuse --> om
+    fuse --> qm
+    fuse --> dup
+    qm --> om
+    qm --> gclient
+    gclient --> auth
+```
+
+### ObjectManager
+
+`ObjectManager` ist der **einzige** autoritative Zustandsspeicher für alle
+Cache-Daten. Er kennt weder die Drive API noch den QueueManager.
+
+```{mermaid}
+%%| label: fig-object-manager
+%%| fig-cap: "ObjectManager — interne Struktur"
+classDiagram
+    class ObjectManager {
+        -AtomicU64 next_ino
+        -DashMap ino_to_id: u64→String
+        -DashMap id_to_ino: String→u64
+        -DashMap id_to_info: String→FileInfo
+        -DashMap dir_cache: String→DirEntry
+        -ContentCache content_cache
+        -DashMap name_index: (u64,String)→u64
+        +get_or_create_ino(drive_id) u64
+        +store_dir(parent_id, listing, etag) void
+        +get_dir_files(parent_id) Option~Vec~FileInfo~~
+        +is_dir_stale(parent_id) bool
+        +is_dir_invalid(parent_id) bool
+        +invalidate_dir(parent_id) void
+        +store_metadata(id, info) void
+        +get_metadata(ino) Option~FileInfo~
+        +store_content(id, bytes) void
+        +get_content(id) Option~Vec~u8~~
+        +lookup_name(parent_ino, name) Option~u64~
+    }
+
+    class ContentCache {
+        -Mutex~ContentCacheInner~ inner
+        -u64 max_bytes
+        +get(file_id) Option~Vec~u8~~
+        +insert(file_id, data) void
+    }
+
+    class DirEntry {
+        +Vec~FileInfo~ files
+        +String etag
+        +DirState state
+        +SystemTime fetched_at
+    }
+
+    class DirState {
+        <<enumeration>>
+        Fresh
+        Stale
+        Invalid
+    }
+
+    ObjectManager --> ContentCache
+    ObjectManager --> DirEntry
+    DirEntry --> DirState
+```
+
+### QueueManager
+
+```{mermaid}
+%%| label: fig-queue-manager
+%%| fig-cap: "QueueManager — Deduplizierungslogik"
+sequenceDiagram
+    participant F as FuseOps
+    participant QM as QueueManager
+    participant T as tracking: DashMap
+    participant W as Worker
+    participant OM as ObjectManager
+
+    F->>QM: enqueue_and_wait(FetchDir("abc"), High)
+    QM->>T: entry("abc") vorhanden?
+
+    alt Task bereits bekannt (queued oder in-flight)
+        T-->>QM: ja → TaskCompletion anhängen
+        W-->>QM: Ergebnis (Condvar-Signal)
+        QM-->>F: TaskResult
+    else Neuer Task
+        T-->>QM: nein → eintragen + senden
+        QM->>W: channel.send(Task)
+        W->>OM: GClient::listFiles → store_dir
+        W->>T: tracking.remove("abc") → alle Completions benachrichtigen
+        QM-->>F: TaskResult
+    end
+```
+
+#### Task-Prioritäten
+
+| Priorität | Auslöser | Beispiele |
+|---|---|---|
+| `High` | Benutzer-ausgelöste FUSE-Operation | `lookup`, `readdir`, `read` |
+| `Normal` | Hintergrund-Prefetch Verzeichnisse | Root-Listing beim Start, Unterverzeichnisse |
+| `Low` | Hintergrund-Prefetch Dateien | Kleine Dateien ≤ 512 KiB |
+
+Worker prüfen HIGH-Queue zuerst (non-blocking), dann NORMAL, dann blockieren
+sie auf einem `select!` über alle drei.
+
+### DupMapping
+
+Wenn Google Drive mehrere Dateien mit demselben Namen im selben Verzeichnis
+erlaubt (was lokal nicht möglich ist), löst `DupMapping` den Konflikt:
+
+```{mermaid}
+%%| label: fig-dup-mapping
+%%| fig-cap: "DupMapping — Namenskollisions-Auflösung"
+flowchart TD
+    A["Drive-Listing:<br/>'report.pdf' (id=abc)<br/>'report.pdf' (id=xyz)"]
+    B{"Namenskollision?"}
+    C["Erster Eintrag: 'report.pdf'"]
+    D["Weiterer Eintrag:<br/>'report (2).pdf'"]
+    E["Persistenz:<br/>~/.gdrive-fuse-rs/dup-mapping"]
+
+    A --> B
+    B -- nein --> C
+    B -- ja --> D
+    D -->|"Mapping speichern"| E
+    E -->|"Wiederherstellen beim Neustart"| D
+```
+
+## Vergleich der Implementierungen
+
+| Aspekt | C++ | Rust |
+|---|---|---|
+| Sprache/Standard | C++20 | Rust 2021 |
+| FUSE-Bibliothek | libfuse3 (direkt) | fuser 0.14 |
+| HTTP-Client | cpr (libcurl) | reqwest (blocking) |
+| Locking (Cache) | `std::shared_mutex` | `dashmap::DashMap` (16 Shards) |
+| Locking (Token) | `std::mutex` | `parking_lot::RwLock` |
+| Task-Queue | – | crossbeam-channel (3 Prioritäten) |
+| Content-Cache | `std::unordered_map` | LRU/FIFO, byte-bounded (1 GiB) |
+| Fehlermodell | Exceptions + POSIX-Codes | `anyhow::Result` + POSIX-Codes |
+| Duplikat-Namen | – | DupMapping (persistent) |
+| Startup-Prefetch | – | Ja (parallele Worker) |
+
+## Sicherheitsaspekte
+
+- OAuth2-Tokens und Client-Secrets werden **niemals geloggt**.
+- `credentials.json` und `.gdrive_tokens.json` stehen in `.gitignore`.
+- Alle API-Antworten werden auf HTTP-Statuscode geprüft **bevor** JSON geparst
+  wird.
+- Kein `system()` / `popen()` — keine Shell-Injection-Angriffsfläche.
+- Der CSRF-State-Parameter im OAuth2-Flow schützt vor Open-Redirect-Angriffen.
+
+## Konventionen & Codesstil
+
+### C++
+
+| Regel | Detail |
+|---|---|
+| Formatierung | `.clang-format` (LLVM-Basis, 100-Spalten-Limit, 4 Leerzeichen) |
+| Include-Guards | `#pragma once` |
+| Include-Reihenfolge | Projekt → Drittanbieter → Standardbibliothek |
+| Pointer | Keine rohen besitzenden Pointer; `shared_ptr` / `unique_ptr` |
+| Return-Annotation | `[[nodiscard]]` überall, wo Ignorieren ein Fehler ist |
+| String-Parameter | `std::string_view` für read-only |
+| Dokumentation | Doxygen `/** */` für öffentliche API |
+
+### Rust
+
+| Regel | Detail |
+|---|---|
+| Edition | 2021 |
+| Linting | `#![deny(warnings)]`; `cargo clippy -- -D warnings` |
+| Fehlerbehandlung | `?`-Operator; `anyhow::Result` |
+| Unsafe | Kein `unsafe` ohne `// SAFETY:`-Kommentar |
+| Formatierung | `cargo fmt` (Standard-Einstellungen) |
+
+## Erweiterbarkeit — neuen Client hinzufügen
+
+Das Monorepo ist auf neue Sprachimplementierungen ausgelegt:
+
+```{mermaid}
+%%| label: fig-new-client
+%%| fig-cap: "Ablauf: neuen Client hinzufügen"
+flowchart TD
+    A["clients/&lt;lang&gt;/ anlegen<br/>mit nativem Build-System"]
+    B["Schnittstelle implementieren:<br/>list_files · revalidate_dir<br/>get_file_metadata · download_file<br/>getattr · readdir · read<br/>OAuth2 + Token-Refresh"]
+    C["Makefile-Targets ergänzen:<br/>build-&lt;lang&gt; · run-&lt;lang&gt;<br/>lint-&lt;lang&gt; · format-&lt;lang&gt;"]
+    D["copilot-instructions.md<br/>unter 'Language-specific notes' aktualisieren"]
+
+    A --> B --> C --> D
+```
