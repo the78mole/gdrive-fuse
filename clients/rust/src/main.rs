@@ -75,20 +75,32 @@ fn main() -> Result<()> {
         .map(|c| c.lines().any(|l| l.trim() == "user_allow_other"))
         .unwrap_or(false);
 
-    let mut options = vec![
+    let acl = if allow_other {
+        fuser::SessionACL::All
+    } else {
+        info!(
+            "'user_allow_other' not set in /etc/fuse.conf — mounting without \
+             allow_other (unmount with: fusermount3 -u {})",
+            args.mountpoint.display()
+        );
+        fuser::SessionACL::Owner
+    };
+
+    let mut mount_options = vec![
         fuser::MountOption::FSName("gdrive-fuse-rs".to_string()),
         fuser::MountOption::DefaultPermissions,
         fuser::MountOption::RO,
     ];
     if allow_other {
-        options.push(fuser::MountOption::AllowOther);
-        options.push(fuser::MountOption::AutoUnmount);
-    } else {
-        info!("'user_allow_other' not set in /etc/fuse.conf — mounting without allow_other (unmount with: fusermount3 -u {}))", args.mountpoint.display());
+        mount_options.push(fuser::MountOption::AutoUnmount);
     }
 
+    let mut config = fuser::Config::default();
+    config.mount_options = mount_options;
+    config.acl = acl;
+
     info!("Mounting at {}", args.mountpoint.display());
-    fuser::mount2(fs, &args.mountpoint, &options)?;
+    fuser::mount2(fs, &args.mountpoint, &config)?;
 
     Ok(())
 }
