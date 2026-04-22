@@ -3,8 +3,8 @@
 //!
 //! # Concurrency model
 //!
-//! `fuser` serialises all FUSE callbacks through `&mut self`, so the handler
-//! itself is single-threaded.  All Drive API calls are dispatched to the
+//! `fuser` serves FUSE callbacks concurrently via `&self`, so the handler
+//! must be `Send + Sync`.  All Drive API calls are dispatched to the
 //! worker pool via `QueueManager::enqueue_and_wait` (blocking) or
 //! `QueueManager::enqueue` (fire-and-forget).  Cache reads go directly to
 //! `ObjectManager` — `DashMap` shard-locks handle concurrent access between
@@ -24,7 +24,7 @@ use crate::object_manager::{
     is_workspace_type,
 };
 use crate::queue_manager::{Priority, QueueManager, TaskKey, TaskResult};
-use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, Request};
+use fuser::{FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, Request};
 use log::{debug, error, info};
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -181,7 +181,7 @@ impl GDriveFuse {
     fn root_attr() -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
-            ino: ROOT_INO,
+            ino: INodeNo(ROOT_INO),
             size: 0,
             blocks: 0,
             atime: now,
@@ -217,14 +217,14 @@ impl Filesystem for GDriveFuse {
     /// The busy indicator remains visible because `readdir` still blocks on
     /// the queue if the cache is not yet warm (< first page arrived).
     fn opendir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _flags: i32,
+        ino: INodeNo,
+        _flags: OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        debug!("opendir ino={}", ino);
-        if let Some(parent_id) = self.obj.ino_to_drive_id(ino) {
+        debug!("opendir ino={}", ino.0);
+        if let Some(parent_id) = self.obj.ino_to_drive_id(ino.0) {
             if !self.obj.has_cache_entry(&parent_id) {
                 // Cold miss — start eager first-page fetch before readdir arrives.
                 self.queue
@@ -237,16 +237,16 @@ impl Filesystem for GDriveFuse {
             }
             // Fresh — nothing to do.
         }
-        reply.opened(0, 0);
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     // ── lookup ─────────────────────────────────────────────────────────────
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
-        debug!("lookup parent={} name={:?}", parent, name);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
+        debug!("lookup parent={} name={:?}", parent.0, name);
 
-        let Some(parent_id) = self.obj.ino_to_drive_id(parent) else {
-            reply.error(libc::ENOENT);
+        let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
+            reply.error(fuser::Errno::ENOENT);
             return;
         };
         let name_str = name.to_string_lossy();
@@ -255,37 +255,37 @@ impl Filesystem for GDriveFuse {
         // The name-index is intentionally bypassed here: it stores raw base
         // names and would return wrong results for suffixed duplicates.
         let Some(files) = self.get_dir(&parent_id) else {
-            reply.error(libc::EIO);
+            reply.error(fuser::Errno::EIO);
             return;
         };
         for (unique_name, f) in self.dup_map.resolve(&files) {
             if unique_name == name_str.as_ref() {
                 let ino = self.obj.get_or_alloc_ino(&f.id);
-                reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), 0);
+                reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
                 return;
             }
         }
-        reply.error(libc::ENOENT);
+        reply.error(fuser::Errno::ENOENT);
     }
 
     // ── getattr ────────────────────────────────────────────────────────────
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        debug!("getattr ino={}", ino);
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        debug!("getattr ino={}", ino.0);
 
-        if ino == ROOT_INO {
+        if ino.0 == ROOT_INO {
             reply.attr(&TTL, &Self::root_attr());
             return;
         }
 
-        let Some(file_id) = self.obj.ino_to_drive_id(ino) else {
-            reply.error(libc::ENOENT);
+        let Some(file_id) = self.obj.ino_to_drive_id(ino.0) else {
+            reply.error(fuser::Errno::ENOENT);
             return;
         };
 
         // Fast path: metadata already in cache.
         if let Some(info) = self.obj.get_metadata(&file_id) {
-            reply.attr(&TTL, &ObjectManager::make_file_attr(ino, &info));
+            reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info));
             return;
         }
 
@@ -294,15 +294,15 @@ impl Filesystem for GDriveFuse {
             .queue
             .enqueue_and_wait(TaskKey::GetMetadata(file_id.clone()), Priority::High)
         {
-            error!("getattr ino={}: {}", ino, e);
-            reply.error(libc::EIO);
+            error!("getattr ino={}: {}", ino.0, e);
+            reply.error(fuser::Errno::EIO);
             return;
         }
         match self.obj.get_metadata(&file_id) {
-            Some(info) => reply.attr(&TTL, &ObjectManager::make_file_attr(ino, &info)),
+            Some(info) => reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info)),
             None => {
-                error!("getattr ino={}: metadata missing after fetch", ino);
-                reply.error(libc::EIO);
+                error!("getattr ino={}: metadata missing after fetch", ino.0);
+                reply.error(fuser::Errno::EIO);
             }
         }
     }
@@ -310,29 +310,29 @@ impl Filesystem for GDriveFuse {
     // ── readdir ────────────────────────────────────────────────────────────
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir ino={} offset={}", ino, offset);
+        debug!("readdir ino={} offset={}", ino.0, offset);
 
-        let Some(parent_id) = self.obj.ino_to_drive_id(ino) else {
-            reply.error(libc::ENOENT);
+        let Some(parent_id) = self.obj.ino_to_drive_id(ino.0) else {
+            reply.error(fuser::Errno::ENOENT);
             return;
         };
 
         let Some(files) = self.get_dir(&parent_id) else {
-            error!("readdir ino={}: get_dir returned None for '{}'", ino, parent_id);
-            reply.error(libc::EIO);
+            error!("readdir ino={}: get_dir returned None for '{}'", ino.0, parent_id);
+            reply.error(fuser::Errno::EIO);
             return;
         };
 
         let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".to_string()),
-            (ino, FileType::Directory, "..".to_string()),
+            (ino.0, FileType::Directory, ".".to_string()),
+            (ino.0, FileType::Directory, "..".to_string()),
         ];
 
         // Google Drive allows multiple files with the same name in one directory.
@@ -359,7 +359,7 @@ impl Filesystem for GDriveFuse {
         let mut added = 0usize;
         let mut stopped_at: Option<usize> = None;
         for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*child_ino, (i + 1) as i64, *kind, name) {
+            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
                 stopped_at = Some(i);
                 break;
             }
@@ -367,7 +367,7 @@ impl Filesystem for GDriveFuse {
         }
         debug!(
             "readdir ino={} offset={}: added {} entries, stopped_at={:?}",
-            ino, offset, added, stopped_at
+            ino.0, offset, added, stopped_at
         );
         reply.ok();
     }
@@ -375,20 +375,20 @@ impl Filesystem for GDriveFuse {
     // ── read ───────────────────────────────────────────────────────────────
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        debug!("read ino={} offset={} size={}", ino, offset, size);
+        debug!("read ino={} offset={} size={}", ino.0, offset, size);
 
-        let Some(file_id) = self.obj.ino_to_drive_id(ino) else {
-            reply.error(libc::ENOENT);
+        let Some(file_id) = self.obj.ino_to_drive_id(ino.0) else {
+            reply.error(fuser::Errno::ENOENT);
             return;
         };
 
@@ -434,8 +434,8 @@ impl Filesystem for GDriveFuse {
             if let Err(e) =
                 self.queue.enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
             {
-                error!("read ino={}: {}", ino, e);
-                reply.error(libc::EIO);
+                error!("read ino={}: {}", ino.0, e);
+                reply.error(fuser::Errno::EIO);
                 return;
             }
             match self.obj.get_content(&file_id) {
@@ -445,28 +445,28 @@ impl Filesystem for GDriveFuse {
                     reply.data(&content[start..end]);
                 }
                 None => {
-                    error!("read ino={}: content missing after download", ino);
-                    reply.error(libc::EIO);
+                    error!("read ino={}: content missing after download", ino.0);
+                    reply.error(fuser::Errno::EIO);
                 }
             }
         } else {
             // Large file — fetch only the requested range.
             debug!(
                 "read ino={} range offset={} size={} (file_size={})",
-                ino, offset, size, file_size
+                ino.0, offset, size, file_size
             );
             match self.queue.enqueue_and_wait(
-                TaskKey::DownloadFileRange(file_id.clone(), offset as u64, size),
+                TaskKey::DownloadFileRange(file_id.clone(), offset, size),
                 Priority::High,
             ) {
                 Ok(TaskResult::FileContentRange(bytes)) => reply.data(&bytes),
                 Ok(other) => {
-                    error!("read ino={}: unexpected task result {:?}", ino, other);
-                    reply.error(libc::EIO);
+                    error!("read ino={}: unexpected task result {:?}", ino.0, other);
+                    reply.error(fuser::Errno::EIO);
                 }
                 Err(e) => {
-                    error!("read ino={} range: {}", ino, e);
-                    reply.error(libc::EIO);
+                    error!("read ino={} range: {}", ino.0, e);
+                    reply.error(fuser::Errno::EIO);
                 }
             }
         }
@@ -479,21 +479,21 @@ impl Filesystem for GDriveFuse {
     /// probing done by thumbnailers or indexers before they fall back to
     /// reading the file content.
     fn getxattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        _ino: u64,
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
         _name: &std::ffi::OsStr,
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        reply.error(libc::ENODATA);
+        reply.error(fuser::Errno::ENODATA);
     }
 
     /// Return an empty xattr list — there are no extended attributes here.
     fn listxattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        _ino: u64,
+        &self,
+        _req: &fuser::Request,
+        _ino: INodeNo,
         size: u32,
         reply: fuser::ReplyXattr,
     ) {

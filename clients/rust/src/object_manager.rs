@@ -17,7 +17,7 @@
 
 use crate::gclient::{DirListing, FileInfo};
 use dashmap::DashMap;
-use fuser::{FileAttr, FileType};
+use fuser::{FileAttr, FileType, INodeNo};
 use log::{debug, info};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -353,7 +353,7 @@ impl ObjectManager {
         let now = SystemTime::now();
         if info.is_folder {
             FileAttr {
-                ino,
+                ino: INodeNo(ino),
                 size: 0,
                 blocks: 0,
                 atime: now,
@@ -377,7 +377,7 @@ impl ObjectManager {
                 info.size
             };
             FileAttr {
-                ino,
+                ino: INodeNo(ino),
                 size,
                 blocks: size.div_ceil(512),
                 atime: now,
@@ -782,7 +782,7 @@ mod tests {
     fn make_file_attr_for_folder() {
         let f = file("folder-id", "Folder", "application/vnd.google-apps.folder", 0, true);
         let attr = ObjectManager::make_file_attr(5, &f);
-        assert_eq!(attr.ino, 5);
+        assert_eq!(attr.ino, INodeNo(5));
         assert_eq!(attr.kind, FileType::Directory);
         assert_eq!(attr.size, 0);
         assert_eq!(attr.perm, 0o755);
@@ -793,7 +793,7 @@ mod tests {
     fn make_file_attr_for_regular_file() {
         let f = file("reg-id", "image.png", "image/png", 2048, false);
         let attr = ObjectManager::make_file_attr(10, &f);
-        assert_eq!(attr.ino, 10);
+        assert_eq!(attr.ino, INodeNo(10));
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.size, 2048);
         assert_eq!(attr.perm, 0o644);
