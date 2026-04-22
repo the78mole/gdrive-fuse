@@ -114,6 +114,19 @@ target_compile_definitions(gdrive-fuse PRIVATE
     GDRIVE_FUSE_VERSION="${GDRIVE_FUSE_VERSION}"
 )
 
+# Optionally embed CLIENT_ID and CLIENT_SECRET at compile time.
+# Set these environment variables during cmake / make to bake them into the binary.
+# The binary will still accept --client-id / --client-secret / runtime env vars
+# with higher priority than the compiled-in defaults.
+if(DEFINED ENV{CLIENT_ID} AND NOT "$ENV{CLIENT_ID}" STREQUAL "")
+    target_compile_definitions(gdrive-fuse PRIVATE BUILTIN_CLIENT_ID="$ENV{CLIENT_ID}")
+    message(STATUS "Embedding CLIENT_ID into binary")
+endif()
+if(DEFINED ENV{CLIENT_SECRET} AND NOT "$ENV{CLIENT_SECRET}" STREQUAL "")
+    target_compile_definitions(gdrive-fuse PRIVATE BUILTIN_CLIENT_SECRET="$ENV{CLIENT_SECRET}")
+    message(STATUS "Embedding CLIENT_SECRET into binary")
+endif()
+
 # Enable warnings
 target_compile_options(gdrive-fuse PRIVATE
     -Wall

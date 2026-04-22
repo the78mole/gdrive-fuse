@@ -4,22 +4,30 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 void print_usage(const char* program_name) {
-    std::cout << "Usage: " << program_name << " [options] <mountpoint>\n"
-              << "\nOptions:\n"
-              << "  --client-id <id>        OAuth2 client ID (required)\n"
-              << "  --client-secret <secret> OAuth2 client secret (required)\n"
-              << "  --debug                 Enable debug logging\n"
-              << "  --version, -V           Print version and exit\n"
-              << "  --help                  Show this help message\n"
-              << "\nFUSE options can be passed after the mountpoint.\n"
-              << "\nExample:\n"
-              << "  " << program_name << " --client-id abc123 --client-secret xyz789 /mnt/gdrive\n"
-              << std::endl;
+    std::cout
+        << "Usage: " << program_name << " [options] <mountpoint>\n"
+        << "\nOptions:\n"
+        << "  --client-id <id>         OAuth2 client ID (optional if compiled-in or env set)\n"
+        << "  --client-secret <secret> OAuth2 client secret (optional if compiled-in or env set)\n"
+        << "  --debug                  Enable debug logging\n"
+        << "  --version, -V            Print version and exit\n"
+        << "  --help                   Show this help message\n"
+        << "\nCredential resolution order (highest priority first):\n"
+        << "  1. --client-id / --client-secret CLI arguments\n"
+        << "  2. CLIENT_ID / CLIENT_SECRET environment variables\n"
+        << "  3. Values compiled into the binary at build time\n"
+        << "\nFUSE options can be passed after the mountpoint.\n"
+        << "\nExample:\n"
+        << "  " << program_name << " /mnt/gdrive\n"
+        << "  " << program_name << " --client-id abc123 --client-secret xyz789 /mnt/gdrive\n"
+        << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -64,9 +72,35 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Google Drive FUSE client starting...");
 
+    // Credential resolution: CLI arg > runtime env var > compiled-in default.
+    if (client_id.empty()) {
+        if (const char* env_val = std::getenv("CLIENT_ID"); env_val != nullptr) {
+            client_id = env_val;
+        }
+    }
+#ifdef BUILTIN_CLIENT_ID
+    if (client_id.empty()) {
+        client_id = BUILTIN_CLIENT_ID;
+    }
+#endif
+
+    if (client_secret.empty()) {
+        if (const char* env_val = std::getenv("CLIENT_SECRET"); env_val != nullptr) {
+            client_secret = env_val;
+        }
+    }
+#ifdef BUILTIN_CLIENT_SECRET
+    if (client_secret.empty()) {
+        client_secret = BUILTIN_CLIENT_SECRET;
+    }
+#endif
+
     // Validate arguments
     if (client_id.empty() || client_secret.empty()) {
-        spdlog::error("Client ID and client secret are required");
+        spdlog::error(
+            "CLIENT_ID and CLIENT_SECRET are required. "
+            "Pass --client-id/--client-secret, set CLIENT_ID/CLIENT_SECRET env vars, "
+            "or compile with those variables set.");
         print_usage(argv[0]);
         return 1;
     }

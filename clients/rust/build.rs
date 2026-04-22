@@ -10,8 +10,10 @@
 //! pre-release string (e.g. `1.2.3-pr15-3-gabcdef` or `1.2.3-loc-4-dirty`).
 
 fn main() {
-    // Re-run when git state or the env var changes.
+    // Re-run when git state or relevant env vars change.
     println!("cargo:rerun-if-env-changed=GDRIVE_FUSE_VERSION");
+    println!("cargo:rerun-if-env-changed=CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=CLIENT_SECRET");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs");
 

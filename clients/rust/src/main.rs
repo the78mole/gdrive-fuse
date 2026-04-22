@@ -10,23 +10,30 @@ mod gclient;
 mod object_manager;
 mod queue_manager;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Credentials optionally embedded at compile time (set CLIENT_ID / CLIENT_SECRET
+// as environment variables when running `cargo build`).
+const BUILTIN_CLIENT_ID: Option<&str> = option_env!("CLIENT_ID");
+const BUILTIN_CLIENT_SECRET: Option<&str> = option_env!("CLIENT_SECRET");
+
 /// Mount Google Drive as a local filesystem (Rust client).
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// OAuth2 client ID (from credentials.json)
+    /// OAuth2 client ID — pass via --client-id, set CLIENT_ID at runtime,
+    /// or embed at compile time by setting CLIENT_ID during `cargo build`.
     #[arg(long, env = "CLIENT_ID")]
-    client_id: String,
+    client_id: Option<String>,
 
-    /// OAuth2 client secret (from credentials.json)
+    /// OAuth2 client secret — pass via --client-secret, set CLIENT_SECRET at runtime,
+    /// or embed at compile time by setting CLIENT_SECRET during `cargo build`.
     #[arg(long, env = "CLIENT_SECRET")]
-    client_secret: String,
+    client_secret: Option<String>,
 
     /// Mount point directory
     mountpoint: PathBuf,
@@ -47,8 +54,24 @@ fn main() -> Result<()> {
 
     info!("gdrive-fuse-rs starting, mountpoint: {}", args.mountpoint.display());
 
+    // Resolve credentials: runtime arg/env > compiled-in default.
+    let client_id = args
+        .client_id
+        .or_else(|| BUILTIN_CLIENT_ID.map(str::to_string))
+        .context(
+            "CLIENT_ID is required: pass --client-id, set CLIENT_ID env var, \
+             or compile with CLIENT_ID set",
+        )?;
+    let client_secret = args
+        .client_secret
+        .or_else(|| BUILTIN_CLIENT_SECRET.map(str::to_string))
+        .context(
+            "CLIENT_SECRET is required: pass --client-secret, set CLIENT_SECRET env var, \
+             or compile with CLIENT_SECRET set",
+        )?;
+
     // Authenticate
-    let auth = auth::Auth::new(args.client_id.clone(), args.client_secret.clone())?;
+    let auth = auth::Auth::new(client_id, client_secret)?;
     let token = auth.get_access_token()?;
     info!("OAuth2 token obtained");
 
