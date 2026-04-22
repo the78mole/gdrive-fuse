@@ -81,16 +81,25 @@ make install-hooks  # Install pre-commit + commit-msg hooks
 
 ### Run
 
+Credentials are resolved in the following order (highest priority first):
+
+1. `--client-id` / `--client-secret` CLI arguments
+2. `CLIENT_ID` / `CLIENT_SECRET` runtime environment variables
+3. Values **compiled into the binary** at build time (set when running `make build-release`)
+
 ```bash
-# With Make (default mount point: /home/mnt/gdrive-fuse)
-make run CLIENT_ID=<your-client-id> CLIENT_SECRET=<your-client-secret>
+# With Make — credentials already embedded in a release binary:
+make run
 
-# Custom mount point
-make run CLIENT_ID=<id> CLIENT_SECRET=<secret> MOUNT_POINT=/mnt/gdrive
+# Override credentials at runtime:
+make run CLIENT_ID=<id> CLIENT_SECRET=<secret>
 
-# Directly with debug logging
+# Custom mount point:
+make run MOUNT_POINT=/mnt/gdrive
+
+# Directly with debug logging:
 mkdir -p /tmp/gdrive-mount
-./build/gdrive-fuse --client-id <id> --client-secret <secret> --debug /tmp/gdrive-mount -f
+./build/gdrive-fuse --debug /tmp/gdrive-mount -f
 ```
 
 On **first run** a browser window opens automatically for OAuth2 authorisation.

@@ -71,7 +71,9 @@ Produces `build/gdrive-fuse` with debug symbols and assertions enabled.
 
 ### Release build
 
-A Release build requires the OAuth2 credentials to be present in the environment so they can be validated before the binary is shipped:
+For a release build, set `CLIENT_ID` and `CLIENT_SECRET` in the environment
+**before** building — they are compiled directly into the binary so end users
+do not need to supply them:
 
 ```bash
 export CLIENT_ID=<your-client-id>
@@ -84,6 +86,9 @@ Or inline:
 ```bash
 make build-release CLIENT_ID=<id> CLIENT_SECRET=<secret>
 ```
+
+A debug build without credentials is fine for development — credentials can
+always be passed at runtime (see [Running](#running)).
 
 ### All Make targets
 
@@ -144,8 +149,17 @@ The file looks like this:
 
 ## Running
 
+Credentials are resolved in the following order (highest priority first):
+
+1. `--client-id` / `--client-secret` CLI arguments
+2. `CLIENT_ID` / `CLIENT_SECRET` runtime environment variables
+3. Values compiled into the binary at build time
+
 ```bash
-# With Make (default mount point: /home/mnt/gdrive-fuse)
+# With Make — release binary already has credentials embedded:
+make run
+
+# Override credentials at runtime:
 make run CLIENT_ID=<id> CLIENT_SECRET=<secret>
 
 # Custom mount point

@@ -104,12 +104,31 @@ CLIENT_ID=$(jq -r '.installed.client_id' credentials.json)
 CLIENT_SECRET=$(jq -r '.installed.client_secret' credentials.json)
 ```
 
-Alternatively, set them as environment variables (Rust client):
+### Credential Resolution Order
+
+Both clients resolve credentials using the following priority chain
+(highest priority first):
+
+1. `--client-id` / `--client-secret` CLI arguments
+2. `CLIENT_ID` / `CLIENT_SECRET` runtime environment variables
+3. Values **compiled into the binary** at build time
+
+When building a release binary with credentials embedded, end users do not need
+to supply them at all. To embed credentials at build time:
 
 ```bash
-export CLIENT_ID=<your-client-id>
-export CLIENT_SECRET=<your-client-secret>
+# C++ — pass to CMake via environment variables:
+CLIENT_ID=<id> CLIENT_SECRET=<secret> make build-release
+
+# Rust — same mechanism via build.rs:
+CLIENT_ID=<id> CLIENT_SECRET=<secret> cargo build --release
 ```
+
+::: {.callout-tip}
+For CI/CD pipelines, store `CLIENT_ID` and `CLIENT_SECRET` as **repository
+secrets** in GitHub Actions. They are then automatically embedded during the
+release build.
+:::
 
 ## FUSE Group Setup
 
@@ -137,7 +156,10 @@ echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 # Create mount point:
 mkdir -p ~/mnt/gdrive-fuse
 
-# Run manually:
+# Run manually (credentials optional if embedded at build time):
+./clients/cpp/build/gdrive-fuse ~/mnt/gdrive-fuse
+
+# Override credentials at runtime:
 ./clients/cpp/build/gdrive-fuse \
   --client-id "$CLIENT_ID" \
   --client-secret "$CLIENT_SECRET" \
@@ -154,12 +176,16 @@ subsequent starts.
 ### Rust Client
 
 ```bash
+# Run with embedded credentials:
+./clients/rust/target/release/gdrive-fuse-rs ~/mnt/gdrive-fuse
+
+# Override credentials at runtime:
 ./clients/rust/target/debug/gdrive-fuse-rs \
   --client-id "$CLIENT_ID" \
   --client-secret "$CLIENT_SECRET" \
   ~/mnt/gdrive-fuse
 
-# Or using environment variables:
+# Via Make:
 make run-rust
 ```
 
@@ -173,10 +199,16 @@ make run-rust
 Usage: gdrive-fuse [options] <mountpoint>
 
 Options:
-  --client-id <id>         OAuth2 client ID (required)
-  --client-secret <secret> OAuth2 client secret (required)
+  --client-id <id>         OAuth2 client ID (optional if compiled-in or env set)
+  --client-secret <secret> OAuth2 client secret (optional if compiled-in or env set)
   --debug                  Enable debug logging
+  --version, -V            Print version and exit
   --help                   Show help message
+
+Credential resolution order (highest priority first):
+  1. --client-id / --client-secret CLI arguments
+  2. CLIENT_ID / CLIENT_SECRET environment variables
+  3. Values compiled into the binary at build time
 
 FUSE options may be passed after the mountpoint.
 ```
@@ -190,11 +222,13 @@ Arguments:
   <MOUNTPOINT>  Mount point directory
 
 Options:
-      --client-id <CLIENT_ID>         OAuth2 client ID [env: CLIENT_ID]
-      --client-secret <CLIENT_SECRET> OAuth2 client secret [env: CLIENT_SECRET]
+      --client-id <CLIENT_ID>         OAuth2 client ID [env: CLIENT_ID=]
+      --client-secret <CLIENT_SECRET> OAuth2 client secret [env: CLIENT_SECRET=]
   -d, --debug                         Enable debug logging
   -h, --help                          Print help
   -V, --version                       Print version
+
+(If not provided, values compiled into the binary at build time are used.)
 ```
 
 :::

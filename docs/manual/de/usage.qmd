@@ -105,12 +105,31 @@ CLIENT_ID=$(jq -r '.installed.client_id' credentials.json)
 CLIENT_SECRET=$(jq -r '.installed.client_secret' credentials.json)
 ```
 
-Alternativ können die Werte als Umgebungsvariablen gesetzt werden (Rust-Client):
+### Reihenfolge der Zugangsdaten-Auflösung
+
+Beide Clients ermitteln die Zugangsdaten nach folgender Priorität
+(höchste zuerst):
+
+1. `--client-id` / `--client-secret` als CLI-Argumente
+2. Umgebungsvariablen `CLIENT_ID` / `CLIENT_SECRET` zur Laufzeit
+3. Zum Build-Zeitpunkt **in die Binärdatei einkompilierte** Werte
+
+Bei einem Release-Build mit eingebetteten Zugangsdaten müssen Endnutzer
+diese nicht mehr angeben. Zum Einkompilieren beim Build:
 
 ```bash
-export CLIENT_ID=<ihre-client-id>
-export CLIENT_SECRET=<ihr-client-secret>
+# C++ — über Umgebungsvariablen an CMake übergeben:
+CLIENT_ID=<id> CLIENT_SECRET=<secret> make build-release
+
+# Rust — gleicher Mechanismus über build.rs:
+CLIENT_ID=<id> CLIENT_SECRET=<secret> cargo build --release
 ```
+
+::: {.callout-tip}
+Für CI/CD-Pipelines `CLIENT_ID` und `CLIENT_SECRET` als **Repository-Secrets**
+in GitHub Actions hinterlegen. Sie werden dann automatisch beim Release-Build
+eingekompiliert.
+:::
 
 ## FUSE-Gruppe einrichten
 
@@ -138,7 +157,10 @@ echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 # Einhängepunkt erstellen:
 mkdir -p ~/mnt/gdrive-fuse
 
-# Manuell starten:
+# Manuell starten (Zugangsdaten optional, wenn eingekompiliert):
+./clients/cpp/build/gdrive-fuse ~/mnt/gdrive-fuse
+
+# Zugangsdaten zur Laufzeit überschreiben:
 ./clients/cpp/build/gdrive-fuse \
   --client-id "$CLIENT_ID" \
   --client-secret "$CLIENT_SECRET" \
@@ -155,12 +177,16 @@ automatisch wiederverwendet.
 ### Rust-Client
 
 ```bash
+# Mit eingekompilierten Zugangsdaten starten:
+./clients/rust/target/release/gdrive-fuse-rs ~/mnt/gdrive-fuse
+
+# Zugangsdaten zur Laufzeit überschreiben:
 ./clients/rust/target/debug/gdrive-fuse-rs \
   --client-id "$CLIENT_ID" \
   --client-secret "$CLIENT_SECRET" \
   ~/mnt/gdrive-fuse
 
-# Oder mit Umgebungsvariablen:
+# Über Make:
 make run-rust
 ```
 
@@ -174,10 +200,16 @@ make run-rust
 Usage: gdrive-fuse [options] <mountpoint>
 
 Optionen:
-  --client-id <id>         OAuth2 Client-ID (erforderlich)
-  --client-secret <secret> OAuth2 Client-Secret (erforderlich)
+  --client-id <id>         OAuth2 Client-ID (optional, wenn eingekompiliert oder Env gesetzt)
+  --client-secret <secret> OAuth2 Client-Secret (optional, wenn eingekompiliert oder Env gesetzt)
   --debug                  Debug-Logging aktivieren
+  --version, -V            Versionsnummer ausgeben
   --help                   Hilfe anzeigen
+
+Reihenfolge der Zugangsdaten (höchste Priorität zuerst):
+  1. --client-id / --client-secret CLI-Argumente
+  2. Umgebungsvariablen CLIENT_ID / CLIENT_SECRET
+  3. Zum Build-Zeitpunkt einkompilierte Werte
 
 FUSE-Optionen können nach dem Einhängepunkt angegeben werden.
 ```
@@ -191,11 +223,13 @@ Arguments:
   <MOUNTPOINT>  Einhängepunkt-Verzeichnis
 
 Options:
-      --client-id <CLIENT_ID>         OAuth2 Client-ID [env: CLIENT_ID]
-      --client-secret <CLIENT_SECRET> OAuth2 Client-Secret [env: CLIENT_SECRET]
+      --client-id <CLIENT_ID>         OAuth2 Client-ID [env: CLIENT_ID=]
+      --client-secret <CLIENT_SECRET> OAuth2 Client-Secret [env: CLIENT_SECRET=]
   -d, --debug                         Debug-Logging aktivieren
   -h, --help                          Hilfe anzeigen
   -V, --version                       Versionsnummer anzeigen
+
+(Wenn nicht angegeben, werden zum Build-Zeitpunkt einkompilierte Werte verwendet.)
 ```
 
 :::
