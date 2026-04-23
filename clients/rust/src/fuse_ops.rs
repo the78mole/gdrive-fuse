@@ -18,17 +18,34 @@
 //! written the result there.
 
 use crate::dup_mapping::DupMapping;
-use crate::gclient::FileInfo;
+use crate::gclient::{FileInfo, GClient};
 use crate::object_manager::{
     CACHE_MAX_FILE_BYTES, ObjectManager, PREFETCH_MAX_BYTES, ROOT_INO, TTL, desktop_content,
     is_workspace_type,
 };
 use crate::queue_manager::{Priority, QueueManager, TaskKey, TaskResult};
+use dashmap::DashMap;
 use fuser::{FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, Request};
 use log::{debug, error, info};
 use std::ffi::OsStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ── WriteEntry ─────────────────────────────────────────────────────────────
+
+/// In-memory write buffer for an open writable file handle.
+struct WriteEntry {
+    /// Parent directory Drive ID — needed when uploading a new file.
+    parent_id: String,
+    /// File display name — needed when creating a new file on Drive.
+    name: String,
+    /// Drive file ID of an *existing* file being overwritten, or `None` for
+    /// newly created files that have not yet been uploaded to Drive.
+    file_id: Option<String>,
+    /// Accumulated write data.  Grows on `write`, uploaded on `release`.
+    content: Vec<u8>,
+}
 
 // ── GDriveFuse ─────────────────────────────────────────────────────────────
 
@@ -37,6 +54,12 @@ pub struct GDriveFuse {
     obj: Arc<ObjectManager>,
     queue: Arc<QueueManager>,
     dup_map: Arc<DupMapping>,
+    /// Drive API client — used directly for write operations.
+    client: Arc<GClient>,
+    /// Per-file-handle write buffers, keyed by file handle number.
+    write_buffers: DashMap<u64, WriteEntry>,
+    /// Monotonically increasing file handle counter.
+    next_fh: AtomicU64,
 }
 
 impl GDriveFuse {
@@ -44,6 +67,7 @@ impl GDriveFuse {
         obj: Arc<ObjectManager>,
         queue: Arc<QueueManager>,
         dup_map: Arc<DupMapping>,
+        client: Arc<GClient>,
     ) -> Self {
         // Kick off an eager root prefetch immediately after mount so the root
         // listing is already in cache when the user first runs `ls`.
@@ -100,7 +124,7 @@ impl GDriveFuse {
                 })
                 .ok();
         }
-        Self { obj, queue, dup_map }
+        Self { obj, queue, dup_map, client, write_buffers: DashMap::new(), next_fh: AtomicU64::new(1) }
     }
 
     // ── Directory helper ──────────────────────────────────────────────────
@@ -502,6 +526,467 @@ impl Filesystem for GDriveFuse {
             reply.size(0);
         } else {
             reply.data(&[]);
+        }
+    }
+
+    // ── mkdir ──────────────────────────────────────────────────────────────
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        let name_str = name.to_string_lossy();
+        debug!("mkdir parent={} name={:?}", parent.0, name_str);
+
+        let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        match self.client.create_folder(&name_str, &parent_id) {
+            Ok(info) => {
+                self.obj.invalidate_dir(&parent_id);
+                let ino = self.obj.get_or_alloc_ino(&info.id);
+                self.obj.store_metadata(info.clone());
+                reply.entry(&TTL, &ObjectManager::make_file_attr(ino, &info), Generation(0));
+            }
+            Err(e) => {
+                error!("mkdir '{}': {}", name_str, e);
+                reply.error(fuser::Errno::EIO);
+            }
+        }
+    }
+
+    // ── unlink ─────────────────────────────────────────────────────────────
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        let name_str = name.to_string_lossy();
+        debug!("unlink parent={} name={:?}", parent.0, name_str);
+
+        let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let Some(files) = self.get_dir(&parent_id) else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
+
+        // Resolve through the duplicate-name map so the caller's unique name
+        // (e.g. "file (1).txt") is correctly matched to the right Drive file.
+        let file_id = self
+            .dup_map
+            .resolve(&files)
+            .into_iter()
+            .find(|(unique, f)| unique == name_str.as_ref() && !f.is_folder)
+            .map(|(_, f)| f.id.clone());
+
+        let Some(file_id) = file_id else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        match self.client.delete_file(&file_id) {
+            Ok(()) => {
+                self.obj.remove_metadata(&file_id);
+                self.obj.invalidate_dir(&parent_id);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("unlink '{}': {}", file_id, e);
+                reply.error(fuser::Errno::EIO);
+            }
+        }
+    }
+
+    // ── rmdir ──────────────────────────────────────────────────────────────
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        let name_str = name.to_string_lossy();
+        debug!("rmdir parent={} name={:?}", parent.0, name_str);
+
+        let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let Some(files) = self.get_dir(&parent_id) else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
+
+        let dir_id = self
+            .dup_map
+            .resolve(&files)
+            .into_iter()
+            .find(|(unique, f)| unique == name_str.as_ref() && f.is_folder)
+            .map(|(_, f)| f.id.clone());
+
+        let Some(dir_id) = dir_id else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        match self.client.delete_file(&dir_id) {
+            Ok(()) => {
+                self.obj.remove_metadata(&dir_id);
+                self.obj.invalidate_dir(&parent_id);
+                self.obj.invalidate_dir(&dir_id);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("rmdir '{}': {}", dir_id, e);
+                reply.error(fuser::Errno::EIO);
+            }
+        }
+    }
+
+    // ── rename ─────────────────────────────────────────────────────────────
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let name_str = name.to_string_lossy();
+        let newname_str = newname.to_string_lossy();
+        debug!(
+            "rename parent={} name={:?} → newparent={} newname={:?}",
+            parent.0, name_str, newparent.0, newname_str
+        );
+
+        let (Some(parent_id), Some(newparent_id)) = (
+            self.obj.ino_to_drive_id(parent.0),
+            self.obj.ino_to_drive_id(newparent.0),
+        ) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let Some(files) = self.get_dir(&parent_id) else {
+            reply.error(fuser::Errno::EIO);
+            return;
+        };
+
+        let file_id = self
+            .dup_map
+            .resolve(&files)
+            .into_iter()
+            .find(|(unique, _)| unique == name_str.as_ref())
+            .map(|(_, f)| f.id.clone());
+
+        let Some(file_id) = file_id else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let (new_parent_arg, old_parent_arg) = if parent_id != newparent_id {
+            (Some(newparent_id.as_str()), Some(parent_id.as_str()))
+        } else {
+            (None, None)
+        };
+
+        match self
+            .client
+            .rename_file(&file_id, &newname_str, new_parent_arg, old_parent_arg)
+        {
+            Ok(updated) => {
+                self.obj.store_metadata(updated);
+                self.obj.invalidate_dir(&parent_id);
+                if parent_id != newparent_id {
+                    self.obj.invalidate_dir(&newparent_id);
+                }
+                reply.ok();
+            }
+            Err(e) => {
+                error!("rename '{}': {}", file_id, e);
+                reply.error(fuser::Errno::EIO);
+            }
+        }
+    }
+
+    // ── create ─────────────────────────────────────────────────────────────
+
+    /// Create and open a new file.  The file is buffered in memory and
+    /// uploaded to Drive on `release`.
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let name_str = name.to_string_lossy().into_owned();
+        debug!("create parent={} name={:?}", parent.0, name_str);
+
+        let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        let pending_id = format!("__pending__{}", fh);
+
+        // Placeholder metadata so getattr works before the first flush.
+        let placeholder = FileInfo {
+            id: pending_id.clone(),
+            name: name_str.clone(),
+            mime_type: "application/octet-stream".to_string(),
+            size: 0,
+            modified_time: String::new(),
+            is_folder: false,
+        };
+        self.obj.store_metadata(placeholder.clone());
+        let ino = self.obj.get_or_alloc_ino(&pending_id);
+
+        self.write_buffers.insert(
+            fh,
+            WriteEntry {
+                parent_id,
+                name: name_str,
+                file_id: None,
+                content: Vec::new(),
+            },
+        );
+
+        let attr = ObjectManager::make_file_attr(ino, &placeholder);
+        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+    }
+
+    // ── open ───────────────────────────────────────────────────────────────
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
+        debug!("open ino={} flags={:?}", ino.0, flags);
+
+        if ino.0 == ROOT_INO {
+            reply.error(fuser::Errno::EISDIR);
+            return;
+        }
+
+        let Some(file_id) = self.obj.ino_to_drive_id(ino.0) else {
+            reply.error(fuser::Errno::ENOENT);
+            return;
+        };
+
+        let writable = (flags.0 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+
+        if writable {
+            let truncate = (flags.0 & libc::O_TRUNC) != 0;
+            let initial_content = if truncate {
+                Vec::new()
+            } else {
+                // Seed the write buffer with the existing content so O_RDWR
+                // overwrites work correctly.
+                if let Some(cached) = self.obj.get_content(&file_id) {
+                    cached
+                } else {
+                    match self
+                        .queue
+                        .enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
+                    {
+                        Ok(_) => self.obj.get_content(&file_id).unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+            };
+
+            let name = self
+                .obj
+                .get_metadata(&file_id)
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+
+            let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+            self.write_buffers.insert(
+                fh,
+                WriteEntry {
+                    parent_id: String::new(), // not needed for updates
+                    name,
+                    file_id: Some(file_id),
+                    content: initial_content,
+                },
+            );
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+        } else {
+            // Read-only open — no write buffer needed.
+            reply.opened(FileHandle(0), FopenFlags::empty());
+        }
+    }
+
+    // ── write ──────────────────────────────────────────────────────────────
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        debug!("write fh={} offset={} len={}", fh.0, offset, data.len());
+
+        let Some(mut entry) = self.write_buffers.get_mut(&fh.0) else {
+            reply.error(fuser::Errno::EBADF);
+            return;
+        };
+
+        let start = offset as usize;
+        let end = start + data.len();
+        if end > entry.content.len() {
+            entry.content.resize(end, 0);
+        }
+        entry.content[start..end].copy_from_slice(data);
+
+        reply.written(data.len() as u32);
+    }
+
+    // ── flush ──────────────────────────────────────────────────────────────
+
+    /// Called on each `close(2)` from user space.  Since a file descriptor
+    /// can be duplicated, `flush` may arrive multiple times per `open`.  We
+    /// defer the actual upload to `release` (called exactly once per open).
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    // ── release ────────────────────────────────────────────────────────────
+
+    /// Called once when the last reference to an open file handle is dropped.
+    /// Uploads any buffered write data to Google Drive.
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("release ino={} fh={}", ino.0, fh.0);
+
+        let Some((_, entry)) = self.write_buffers.remove(&fh.0) else {
+            // Read-only file handle — nothing to upload.
+            reply.ok();
+            return;
+        };
+
+        match &entry.file_id {
+            Some(file_id) => {
+                // Update existing Drive file.
+                match self.client.update_file_content(file_id, &entry.content) {
+                    Ok(updated) => {
+                        self.obj.store_metadata(updated);
+                        self.obj.store_content(file_id, entry.content);
+                        reply.ok();
+                    }
+                    Err(e) => {
+                        error!("release: update_file_content '{}': {}", file_id, e);
+                        reply.error(fuser::Errno::EIO);
+                    }
+                }
+            }
+            None => {
+                // New file — upload to Drive and swap the pending placeholder ID.
+                let pending_id = format!("__pending__{}", fh.0);
+                match self
+                    .client
+                    .create_file(&entry.name, &entry.parent_id, &entry.content)
+                {
+                    Ok(mut new_info) => {
+                        new_info.size = entry.content.len() as u64;
+                        let real_id = new_info.id.clone();
+                        self.obj.replace_pending_id(&pending_id, new_info);
+                        self.obj.invalidate_dir(&entry.parent_id);
+                        self.obj.store_content(&real_id, entry.content);
+                        reply.ok();
+                    }
+                    Err(e) => {
+                        error!("release: create_file '{}': {}", entry.name, e);
+                        reply.error(fuser::Errno::EIO);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── setattr ────────────────────────────────────────────────────────────
+
+    /// Handle attribute changes.  Only `size` (truncation) is acted upon;
+    /// all other fields are acknowledged but not persisted (Drive has no
+    /// POSIX permission model).
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        debug!("setattr ino={} size={:?} fh={:?}", ino.0, size, fh.map(|h| h.0));
+
+        // Truncate the write buffer if a specific file handle is given.
+        if let (Some(new_size), Some(fh)) = (size, fh) {
+            if let Some(mut entry) = self.write_buffers.get_mut(&fh.0) {
+                entry.content.resize(new_size as usize, 0);
+            }
+        }
+
+        // Return current (or updated) attributes.
+        if ino.0 == ROOT_INO {
+            reply.attr(&TTL, &Self::root_attr());
+            return;
+        }
+
+        let file_id = self.obj.ino_to_drive_id(ino.0);
+        let info = file_id.as_deref().and_then(|id| self.obj.get_metadata(id));
+
+        match info {
+            Some(info) => {
+                let mut attr = ObjectManager::make_file_attr(ino.0, &info);
+                if let Some(new_size) = size {
+                    attr.size = new_size;
+                }
+                reply.attr(&TTL, &attr);
+            }
+            None => {
+                reply.attr(&TTL, &Self::root_attr());
+            }
         }
     }
 }

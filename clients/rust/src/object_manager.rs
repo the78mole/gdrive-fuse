@@ -79,6 +79,15 @@ impl ContentCache {
         self.inner.lock().map.get(file_id).cloned()
     }
 
+    /// Remove an entry from the cache.
+    pub fn remove(&self, file_id: &str) {
+        let mut inner = self.inner.lock();
+        if let Some(old) = inner.map.remove(file_id) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(old.len() as u64);
+            inner.order.retain(|k| k != file_id);
+        }
+    }
+
     /// Insert or replace an entry, evicting oldest entries as needed.
     pub fn insert(&self, file_id: &str, data: Vec<u8>) {
         let new_size = data.len() as u64;
@@ -345,6 +354,37 @@ impl ObjectManager {
     /// LRU eviction happens automatically if the byte budget is exceeded.
     pub fn store_content(&self, file_id: &str, content: Vec<u8>) {
         self.content_cache.insert(file_id, content);
+    }
+
+    // ── Write-support helpers ─────────────────────────────────────────────
+
+    /// Remove a directory listing from the cache so the next access triggers
+    /// a fresh fetch from the Drive API.
+    pub fn invalidate_dir(&self, parent_id: &str) {
+        self.dir_cache.remove(parent_id);
+        debug!("invalidate_dir('{}')", parent_id);
+    }
+
+    /// Evict file metadata and cached content for `file_id`.
+    pub fn remove_metadata(&self, file_id: &str) {
+        self.metadata.remove(file_id);
+        self.content_cache.remove(file_id);
+        debug!("remove_metadata('{}')", file_id);
+    }
+
+    /// Replace a temporary pending file ID (used for newly created files
+    /// before their first upload) with the permanent Drive file ID.
+    ///
+    /// The inode assigned to `old_id` is reused for `new_info.id` so that
+    /// open file handles remain valid across the flush.
+    pub fn replace_pending_id(&self, old_id: &str, new_info: FileInfo) {
+        if let Some((_, ino)) = self.id_to_ino.remove(old_id) {
+            self.ino_to_id.insert(ino, new_info.id.clone());
+            self.id_to_ino.insert(new_info.id.clone(), ino);
+        }
+        self.metadata.remove(old_id);
+        self.metadata.insert(new_info.id.clone(), new_info);
+        debug!("replace_pending_id: '{}' → recorded new id", old_id);
     }
 
     // ── FileAttr helpers (shared between fuse_ops and here) ───────────────

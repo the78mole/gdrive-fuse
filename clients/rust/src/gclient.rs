@@ -381,6 +381,154 @@ impl GClient {
         );
         Ok(bytes)
     }
+
+    // ── Write operations ──────────────────────────────────────────────────
+
+    /// Create a new folder on Google Drive.
+    pub fn create_folder(&self, name: &str, parent_id: &str) -> Result<FileInfo> {
+        let token = self.get_token()?;
+        let url = format!(
+            "{}/files?fields=id,name,mimeType,size,modifiedTime",
+            self.base_url
+        );
+        let metadata = serde_json::json!({
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&metadata)
+            .send()?
+            .error_for_status()?;
+        let mut info: FileInfo = resp.json()?;
+        info.is_folder = true;
+        debug!("create_folder '{}' in '{}' → id={}", name, parent_id, info.id);
+        Ok(info)
+    }
+
+    /// Upload a new file to Google Drive using multipart upload.
+    pub fn create_file(&self, name: &str, parent_id: &str, content: &[u8]) -> Result<FileInfo> {
+        let token = self.get_token()?;
+        // Derive the upload endpoint from base_url.
+        let upload_base = self.base_url.replace("/drive/v3", "/upload/drive/v3");
+        let url = format!(
+            "{}/files?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime",
+            upload_base
+        );
+        let boundary = "gdrive_fuse_boundary_4a2f8b1c3e7d9";
+        let metadata = serde_json::json!({ "name": name, "parents": [parent_id] });
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n",
+                boundary
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(metadata.to_string().as_bytes());
+        body.extend_from_slice(
+            format!(
+                "\r\n--{}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                boundary
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{}--", boundary).as_bytes());
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={}", boundary),
+            )
+            .body(body)
+            .send()?
+            .error_for_status()?;
+        let mut info: FileInfo = resp.json()?;
+        info.is_folder = false;
+        info.size = content.len() as u64;
+        debug!("create_file '{}' in '{}' → id={}", name, parent_id, info.id);
+        Ok(info)
+    }
+
+    /// Update the content of an existing file on Google Drive (media upload).
+    pub fn update_file_content(&self, file_id: &str, content: &[u8]) -> Result<FileInfo> {
+        let token = self.get_token()?;
+        let upload_base = self.base_url.replace("/drive/v3", "/upload/drive/v3");
+        let url = format!(
+            "{}/files/{}?uploadType=media&fields=id,name,mimeType,size,modifiedTime",
+            upload_base, file_id
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&token)
+            .header("Content-Type", "application/octet-stream")
+            .body(content.to_vec())
+            .send()?
+            .error_for_status()?;
+        let mut info: FileInfo = resp.json()?;
+        info.is_folder = false;
+        info.size = content.len() as u64;
+        debug!("update_file_content '{}': {} bytes", file_id, content.len());
+        Ok(info)
+    }
+
+    /// Permanently delete a file or folder from Google Drive.
+    pub fn delete_file(&self, file_id: &str) -> Result<()> {
+        let token = self.get_token()?;
+        let url = format!("{}/files/{}", self.base_url, file_id);
+        self.http
+            .delete(&url)
+            .bearer_auth(&token)
+            .send()?
+            .error_for_status()?;
+        debug!("delete_file '{}'", file_id);
+        Ok(())
+    }
+
+    /// Rename and/or move a file or folder.
+    ///
+    /// Supply `new_parent_id` and `old_parent_id` to move to a different
+    /// parent directory; leave both as `None` to rename in place.
+    pub fn rename_file(
+        &self,
+        file_id: &str,
+        new_name: &str,
+        new_parent_id: Option<&str>,
+        old_parent_id: Option<&str>,
+    ) -> Result<FileInfo> {
+        let token = self.get_token()?;
+        let mut url = format!(
+            "{}/files/{}?fields=id,name,mimeType,size,modifiedTime",
+            self.base_url, file_id
+        );
+        if let (Some(new_p), Some(old_p)) = (new_parent_id, old_parent_id) {
+            url.push_str(&format!("&addParents={}&removeParents={}", new_p, old_p));
+        }
+        let body = serde_json::json!({ "name": new_name });
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()?
+            .error_for_status()?;
+        let mut info: FileInfo = resp.json()?;
+        info.is_folder = info.mime_type == "application/vnd.google-apps.folder";
+        debug!(
+            "rename_file '{}' → '{}' (parent: {:?} → {:?})",
+            file_id, new_name, old_parent_id, new_parent_id
+        );
+        Ok(info)
+    }
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

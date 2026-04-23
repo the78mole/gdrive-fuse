@@ -90,7 +90,7 @@ fn main() -> Result<()> {
     info!("dup-mapping: {:?}", dup_map_path);
     let dup_map = Arc::new(dup_mapping::DupMapping::load(dup_map_path));
 
-    let fs = fuse_ops::GDriveFuse::new(obj, queue, dup_map);
+    let fs = fuse_ops::GDriveFuse::new(obj, queue, dup_map, Arc::clone(&client));
 
     // Mount options — AllowOther requires `user_allow_other` in /etc/fuse.conf;
     // omit it if the file doesn't have it to avoid a hard startup failure.
