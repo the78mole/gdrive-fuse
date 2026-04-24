@@ -18,9 +18,11 @@
 use crate::gclient::{DirListing, FileInfo};
 use dashmap::DashMap;
 use fuser::{FileAttr, FileType, INodeNo};
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,17 +31,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const TTL: Duration = Duration::from_secs(30);
 pub const ROOT_INO: u64 = 1;
 
-/// Files at or below this size are enqueued for **proactive prefetch** by the
-/// dedicated small-file worker pool.  Does not affect what gets cached —
-/// see `CACHE_MAX_FILE_BYTES` for that.
-pub const PREFETCH_MAX_BYTES: u64 = 512 * 1024; // 64 KiB
+/// Files at or below this size are stored in the **RAM** content cache on
+/// first read.  Larger files are written atomically to `~/.gdrive/cache/<id>`
+/// on disk — they survive remounts without re-downloading and never exhaust
+/// process memory.  Each `read()` for a cached large file issues a single
+/// `seek()` + `read_exact()` on the local file; no HTTP request is needed.
+pub const CACHE_RAM_MAX_BYTES: u64 = 4 * 1024; // 4 KiB → RAM
 
-/// Files at or below this size are fully downloaded into the in-memory content
-/// cache on first read.  Larger files are served via HTTP Range requests and
-/// are not stored in the content cache.
-pub const CACHE_MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
-
-/// Maximum total byte footprint of the in-memory content cache.
+/// Maximum total byte footprint of the in-memory RAM content cache.
 /// Least-recently-used entries are evicted once this limit is exceeded.
 pub const CACHE_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
@@ -135,7 +134,78 @@ impl ContentCache {
     }
 }
 
+// ── DiskCache — persistent on-disk file cache ─────────────────────────────
 
+/// Persistent file cache backed by plain files at `~/.gdrive/cache/<file_id>`.
+///
+/// Each file is written atomically (temp file → `rename`) so a crash
+/// mid-write never leaves a partial or corrupt entry.  Reads use `seek()` to
+/// deliver only the kernel-requested slice; the full file is never loaded into
+/// process memory during a normal `read()` call.
+struct DiskCache {
+    dir: PathBuf,
+}
+
+impl DiskCache {
+    fn new(dir: PathBuf) -> Self {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("disk-cache: could not create '{}': {}", dir.display(), e);
+        }
+        Self { dir }
+    }
+
+    fn path_for(&self, file_id: &str) -> PathBuf {
+        self.dir.join(file_id)
+    }
+
+    #[allow(dead_code)]
+    fn contains(&self, file_id: &str) -> bool {
+        self.path_for(file_id).exists()
+    }
+
+    /// Read `[offset, offset+size)` bytes from the cached file.
+    /// Returns `None` when the file is not in cache.
+    /// Returns `Some(empty)` when `offset >= file_len` (beyond EOF).
+    fn read_slice(&self, file_id: &str, offset: u64, size: u32) -> Option<Vec<u8>> {
+        let path = self.path_for(file_id);
+        let file_len = path.metadata().ok()?.len();
+        if offset >= file_len {
+            return Some(Vec::new());
+        }
+        let mut f = std::fs::File::open(&path).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let avail = ((file_len - offset) as usize).min(size as usize);
+        let mut buf = vec![0u8; avail];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Read the complete cached file into memory.
+    /// Only used when seeding a writable `open()` buffer — not for normal reads.
+    fn read_all(&self, file_id: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.path_for(file_id)).ok()
+    }
+
+    /// Write `data` atomically: temp file → rename.
+    fn insert(&self, file_id: &str, data: &[u8]) {
+        let path = self.path_for(file_id);
+        let tmp = self.dir.join(format!("{}.tmp", file_id));
+        if let Err(e) = std::fs::write(&tmp, data) {
+            error!("disk-cache: write '{}': {}", tmp.display(), e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            error!("disk-cache: rename failed: {}", e);
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        info!("disk-cache: stored '{}' ({} bytes)", file_id, data.len());
+    }
+
+    fn remove(&self, file_id: &str) {
+        let _ = std::fs::remove_file(self.path_for(file_id));
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub enum DirCacheState {
@@ -170,8 +240,11 @@ pub struct ObjectManager {
     pub metadata: DashMap<String, FileInfo>,
     /// Parent Drive ID → directory listing.
     pub dir_cache: DashMap<String, DirEntry>,
-    /// Drive file ID → downloaded bytes (byte-bounded LRU cache).
+    /// Drive file ID → downloaded bytes (byte-bounded LRU cache, files ≤ 4 KiB).
     pub content_cache: ContentCache,
+    /// Drive file ID → downloaded bytes on disk (`~/.gdrive/cache/<id>`).
+    /// Used for files > CACHE_RAM_MAX_BYTES to avoid RAM pressure.
+    disk_cache: DiskCache,
     /// `"{parent_id}:{display_name}"` → `file_id` — populated by every dir
     /// store so `lookup` can resolve in O(1) without scanning the listing.
     pub name_index: DashMap<String, String>,
@@ -179,6 +252,21 @@ pub struct ObjectManager {
 
 impl ObjectManager {
     pub fn new() -> Self {
+        let cache_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".gdrive")
+            .join("cache");
+        Self::new_with_disk_dir(cache_dir)
+    }
+
+    /// Test-only constructor: stores disk-cache entries in `cache_dir` instead
+    /// of `~/.gdrive/cache/` so tests stay hermetic.
+    #[cfg(test)]
+    pub fn new_for_test(cache_dir: PathBuf) -> Self {
+        Self::new_with_disk_dir(cache_dir)
+    }
+
+    fn new_with_disk_dir(cache_dir: PathBuf) -> Self {
         let ino_to_id = DashMap::new();
         let id_to_ino = DashMap::new();
         ino_to_id.insert(ROOT_INO, "root".to_string());
@@ -190,6 +278,7 @@ impl ObjectManager {
             metadata: DashMap::new(),
             dir_cache: DashMap::new(),
             content_cache: ContentCache::new(CACHE_MAX_TOTAL_BYTES),
+            disk_cache: DiskCache::new(cache_dir),
             name_index: DashMap::new(),
         }
     }
@@ -222,7 +311,14 @@ impl ObjectManager {
     /// a fetch.
     pub fn get_cached_dir(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
         let entry = self.dir_cache.get(parent_id)?;
-        if entry.state == DirCacheState::Fresh && entry.fetched_at.elapsed() < TTL {
+        // Only return the cached listing if it is both fresh (within TTL) AND
+        // complete (all pages have been fetched).  A partial listing (is_complete
+        // = false) must not short-circuit the caller — the incomplete entry
+        // would appear as a directory with only its first 10 files visible.
+        if entry.state == DirCacheState::Fresh
+            && entry.fetched_at.elapsed() < TTL
+            && entry.is_complete
+        {
             Some(entry.files.clone())
         } else {
             None
@@ -349,11 +445,36 @@ impl ObjectManager {
         self.content_cache.get(file_id)
     }
 
-    /// Store downloaded file content.  Files larger than `CACHE_MAX_FILE_BYTES`
-    /// should not be passed here — callers in `fuse_ops` already guard this.
-    /// LRU eviction happens automatically if the byte budget is exceeded.
+    /// Route downloaded file content to the right cache tier.
+    ///
+    /// - `content.len() ≤ CACHE_RAM_MAX_BYTES` (4 KiB): stored in the in-memory LRU.
+    /// - `content.len() > CACHE_RAM_MAX_BYTES`: written to `~/.gdrive/cache/<id>`
+    ///   and immediately freed from memory.
     pub fn store_content(&self, file_id: &str, content: Vec<u8>) {
-        self.content_cache.insert(file_id, content);
+        if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
+            self.content_cache.insert(file_id, content);
+        } else {
+            self.disk_cache.insert(file_id, &content);
+        }
+    }
+
+    /// Returns `true` when the file is present in the disk cache.
+    /// Only used in tests to assert correct cache routing.
+    #[cfg(test)]
+    pub fn has_disk_content(&self, file_id: &str) -> bool {
+        self.disk_cache.contains(file_id)
+    }
+
+    /// Read `[offset, offset+size)` bytes from the disk cache.
+    /// Returns `None` when the file is not cached on disk.
+    pub fn read_disk_slice(&self, file_id: &str, offset: u64, size: u32) -> Option<Vec<u8>> {
+        self.disk_cache.read_slice(file_id, offset, size)
+    }
+
+    /// Read the full disk-cached file into memory.
+    /// Use only when seeding a writable `open()` buffer; prefer `read_disk_slice` otherwise.
+    pub fn read_full_disk_content(&self, file_id: &str) -> Option<Vec<u8>> {
+        self.disk_cache.read_all(file_id)
     }
 
     // ── Write-support helpers ─────────────────────────────────────────────
@@ -365,26 +486,105 @@ impl ObjectManager {
         debug!("invalidate_dir('{}')", parent_id);
     }
 
-    /// Evict file metadata and cached content for `file_id`.
+    /// Evict cached content for `file_id` from both RAM and disk caches.
+    pub fn invalidate_content(&self, file_id: &str) {
+        self.content_cache.remove(file_id);
+        self.disk_cache.remove(file_id);
+        debug!("invalidate_content('{}')", file_id);
+    }
+
+    /// Evict file metadata and cached content (RAM + disk) for `file_id`.
     pub fn remove_metadata(&self, file_id: &str) {
         self.metadata.remove(file_id);
         self.content_cache.remove(file_id);
+        self.disk_cache.remove(file_id);
         debug!("remove_metadata('{}')", file_id);
+    }
+
+    /// Look up a file ID by parent directory ID and FUSE display-name.
+    ///
+    /// Consults the name-index directly, bypassing the dir-cache.  This is
+    /// the correct fallback in `rename()` when an intermediate `unlink` (e.g.
+    /// on the overwrite target) has called `invalidate_dir` and wiped the
+    /// dir-cache entry — the pending placeholder is still in the name-index.
+    pub fn lookup_id_by_parent_and_name(&self, parent_id: &str, name: &str) -> Option<String> {
+        // Regular file, folder, and pending placeholder key.
+        let plain_key = format!("{}:{}", parent_id, name);
+        if let Some(v) = self.name_index.get(&plain_key) {
+            return Some(v.clone());
+        }
+        // Workspace .desktop files: the FUSE name already includes ".desktop"
+        // so the plain-key lookup above already finds it.
+        None
+    }
+
+    /// Inject a placeholder `FileInfo` into the parent's dir-cache entry so
+    /// that `rename()` can locate it by name before the upload to Drive has
+    /// finished.  Also registers the inode and name-index entries.
+    ///
+    /// If no dir-cache entry exists for `parent_id` yet the file will become
+    /// visible on the next `readdir` after the Drive listing is fetched.
+    pub fn inject_pending_into_dir(&self, parent_id: &str, info: FileInfo) {
+        self.get_or_alloc_ino(&info.id);
+        self.name_index
+            .insert(make_name_key(parent_id, &info.name, &info.mime_type), info.id.clone());
+        if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
+            if !entry.files.iter().any(|f| f.id == info.id) {
+                entry.files.push(info);
+            }
+        }
+    }
+
+    /// Remove a pending placeholder from the parent's dir-cache (upload
+    /// failed path).  Cleans up metadata, name-index and inode maps.
+    pub fn remove_pending_from_dir(&self, parent_id: &str, old_id: &str) {
+        if let Some((_, meta)) = self.metadata.remove(old_id) {
+            let key = make_name_key(parent_id, &meta.name, &meta.mime_type);
+            self.name_index.remove(&key);
+        }
+        self.content_cache.remove(old_id);
+        if let Some((_, ino)) = self.id_to_ino.remove(old_id) {
+            self.ino_to_id.remove(&ino);
+        }
+        if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
+            entry.files.retain(|f| f.id != old_id);
+        }
+        debug!("remove_pending_from_dir: '{}' from parent '{}'", old_id, parent_id);
     }
 
     /// Replace a temporary pending file ID (used for newly created files
     /// before their first upload) with the permanent Drive file ID.
     ///
+    /// `parent_id` is used to update the dir-cache listing in-place so
+    /// `readdir` immediately returns the real entry without an extra Drive
+    /// round-trip.
+    ///
     /// The inode assigned to `old_id` is reused for `new_info.id` so that
     /// open file handles remain valid across the flush.
-    pub fn replace_pending_id(&self, old_id: &str, new_info: FileInfo) {
+    pub fn replace_pending_id(&self, old_id: &str, parent_id: &str, new_info: FileInfo) {
+        // Swap ino maps.
         if let Some((_, ino)) = self.id_to_ino.remove(old_id) {
             self.ino_to_id.insert(ino, new_info.id.clone());
             self.id_to_ino.insert(new_info.id.clone(), ino);
         }
-        self.metadata.remove(old_id);
-        self.metadata.insert(new_info.id.clone(), new_info);
-        debug!("replace_pending_id: '{}' → recorded new id", old_id);
+        // Update name-index: remove old pending key, add real key.
+        if let Some((_, old_meta)) = self.metadata.remove(old_id) {
+            let old_key = make_name_key(parent_id, &old_meta.name, &old_meta.mime_type);
+            self.name_index.remove(&old_key);
+        }
+        let new_key = make_name_key(parent_id, &new_info.name, &new_info.mime_type);
+        self.name_index.insert(new_key, new_info.id.clone());
+        // Update metadata.
+        self.metadata.insert(new_info.id.clone(), new_info.clone());
+        // Update dir-cache in-place: swap __pending__ entry for real entry.
+        if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
+            if let Some(pos) = entry.files.iter().position(|f| f.id == old_id) {
+                entry.files[pos] = new_info;
+            } else {
+                entry.files.push(new_info);
+            }
+        }
+        debug!("replace_pending_id: '{}' → real id stored (parent '{}')", old_id, parent_id);
     }
 
     // ── FileAttr helpers (shared between fuse_ops and here) ───────────────

@@ -20,17 +20,17 @@
 use crate::dup_mapping::DupMapping;
 use crate::gclient::{FileInfo, GClient};
 use crate::object_manager::{
-    CACHE_MAX_FILE_BYTES, ObjectManager, PREFETCH_MAX_BYTES, ROOT_INO, TTL, desktop_content,
-    is_workspace_type,
+    ObjectManager, ROOT_INO, TTL, desktop_content, is_workspace_type,
 };
 use crate::queue_manager::{Priority, QueueManager, TaskKey, TaskResult};
+use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use fuser::{FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, Request};
 use log::{debug, error, info};
 use std::ffi::OsStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── WriteEntry ─────────────────────────────────────────────────────────────
 
@@ -56,10 +56,19 @@ pub struct GDriveFuse {
     dup_map: Arc<DupMapping>,
     /// Drive API client — used directly for write operations.
     client: Arc<GClient>,
+    /// Dedicated Drive API client for upload threads — owns its own HTTP
+    /// connection pool so in-flight downloads never delay uploads.
+    upload_client: Arc<GClient>,
     /// Per-file-handle write buffers, keyed by file handle number.
     write_buffers: DashMap<u64, WriteEntry>,
     /// Monotonically increasing file handle counter.
     next_fh: AtomicU64,
+    /// Sender end of the dedicated upload thread pool.  Closures submitted
+    /// here execute on one of `UPLOAD_THREADS` background threads.
+    upload_tx: Sender<Box<dyn FnOnce() + Send + 'static>>,
+    /// Number of uploads currently in-flight or queued.  Shared with the
+    /// `QueueManager` so Low-prio prefetch workers pause automatically.
+    active_uploads: Arc<AtomicUsize>,
 }
 
 impl GDriveFuse {
@@ -81,42 +90,26 @@ impl GDriveFuse {
                     // listing is complete before any user interaction.
                     match q.enqueue_and_wait(
                         TaskKey::FetchDir("root".to_string()),
-                        Priority::Normal,
+                        Priority::DirPrefetch,
                     ) {
                         Ok(_) => {
                             let files = o.get_dir_files("root").unwrap_or_default();
                             let n_dirs = files.iter().filter(|f| f.is_folder).count();
-                            let n_small = files
-                                .iter()
-                                .filter(|f| {
-                                    !f.is_folder
-                                        && !f.mime_type
-                                            .starts_with("application/vnd.google-apps.")
-                                        && f.size > 0
-                                        && f.size <= PREFETCH_MAX_BYTES
-                                })
-                                .count();
                             info!(
-                                "startup prefetch: root has {} entries, \
-                                 {} dirs, {} small files",
+                                "startup prefetch: root has {} entries, {} dirs",
                                 files.len(),
-                                n_dirs,
-                                n_small
+                                n_dirs
                             );
-                            // Prefetch all root subdirectories (Normal priority).
+                            // Prefetch root subdirectories at P3 (background dir).
                             for f in files.iter().filter(|f| f.is_folder) {
-                                q.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::Normal);
+                                q.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::DirPrefetch);
                             }
-                            // Pre-download files ≤ PREFETCH_MAX_BYTES (64 KiB) on Low
-                            // priority — served by the 24 dedicated small-file workers.
-                            for f in files.iter().filter(|f| {
-                                !f.is_folder
-                                    && !f.mime_type
-                                        .starts_with("application/vnd.google-apps.")
-                                    && f.size > 0
-                                    && f.size <= PREFETCH_MAX_BYTES
-                            }) {
-                                q.enqueue(TaskKey::DownloadFile(f.id.clone()), Priority::Low);
+                            // Prefetch metadata for non-folder files at P4.
+                            for f in files.iter().filter(|f| !f.is_folder) {
+                                q.enqueue(
+                                    TaskKey::GetMetadata(f.id.clone()),
+                                    Priority::MetaPrefetch,
+                                );
                             }
                         }
                         Err(e) => error!("startup prefetch failed: {}", e),
@@ -124,7 +117,37 @@ impl GDriveFuse {
                 })
                 .ok();
         }
-        Self { obj, queue, dup_map, client, write_buffers: DashMap::new(), next_fh: AtomicU64::new(1) }
+        // ── Upload thread pool ───────────────────────────────────────────────
+        // 4 dedicated threads serve asynchronous Drive uploads so FUSE
+        // `release()` can return to the kernel immediately.
+        const UPLOAD_THREADS: usize = 4;
+        let (upload_tx, upload_rx) =
+            crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+        // Reuse the counter from QueueManager — Low-prio workers check it.
+        let active_uploads = Arc::clone(&queue.active_uploads);
+        for i in 0..UPLOAD_THREADS {
+            let rx = upload_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("gdrive-upload-{}", i))
+                .spawn(move || {
+                    for task in rx.iter() {
+                        task();
+                    }
+                    debug!("upload-{}: channel closed, exiting", i);
+                })
+                .expect("failed to spawn upload thread");
+        }
+        Self {
+            obj,
+            queue,
+            dup_map,
+            upload_client: Arc::new(client.fork()),
+            client,
+            write_buffers: DashMap::new(),
+            next_fh: AtomicU64::new(1),
+            upload_tx,
+            active_uploads,
+        }
     }
 
     // ── Directory helper ──────────────────────────────────────────────────
@@ -147,16 +170,23 @@ impl GDriveFuse {
             return Some(files);
         }
 
-        // Fast path 2 — stale entry: serve immediately and fire a background
-        // ETag revalidation (stale-while-revalidate).  The listing will be
-        // refreshed for the next readdir cycle without blocking the user.
+        // Fast path 2 — stale or incomplete entry: serve immediately and fire a
+        // full fetch so the listing is refreshed for the next readdir cycle.
+        // Partial entries (is_complete = false, in-progress first-page fetch)
+        // fall through here and trigger an urgent FetchDir so the complete
+        // listing arrives as soon as possible.
         if let Some(files) = self.obj.get_dir_files(parent_id) {
+            let priority = if self.obj.is_dir_complete(parent_id) {
+                Priority::DirPrefetch  // stale-while-revalidate — no urgency
+            } else {
+                Priority::DirUrgent    // incomplete listing — fetch remaining pages now
+            };
             self.queue
-                .enqueue(TaskKey::FetchDir(parent_id.to_string()), Priority::Normal);
+                .enqueue(TaskKey::FetchDir(parent_id.to_string()), priority);
             // Prefetch child dirs that are not yet cached.
             for f in files.iter().filter(|f| f.is_folder) {
                 if !self.obj.has_cache_entry(&f.id) {
-                    self.queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::Low);
+                    self.queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::DirPrefetch);
                 }
             }
             return Some(files);
@@ -165,14 +195,17 @@ impl GDriveFuse {
         // Complete miss — fetch the first page and block until it arrives.
         match self
             .queue
-            .enqueue_and_wait(TaskKey::FetchDirFirstPage(parent_id.to_string()), Priority::High)
+            .enqueue_and_wait(TaskKey::FetchDirFirstPage(parent_id.to_string()), Priority::DirNavigate)
         {
             Ok(TaskResult::DirListingPartial(Some((page_token, etag)))) => {
-                // More pages exist — enqueue the continuation at Low priority.
-                // fuse_ops owns the queue Arc so we can enqueue directly here.
+                // More pages exist — enqueue the continuation at DirUrgent (P0)
+                // because the caller is actively navigating this directory and
+                // is waiting for the full listing.  Using DirPrefetch (P3) would
+                // cause the continuation to queue behind potentially many
+                // background prefetch tasks, making the directory appear to hang.
                 self.queue.enqueue(
                     TaskKey::FetchDirPages(parent_id.to_string(), page_token, etag),
-                    Priority::Low,
+                    Priority::DirUrgent,
                 );
             }
             Ok(TaskResult::DirListing) | Ok(TaskResult::DirListingPartial(None)) => {
@@ -193,7 +226,7 @@ impl GDriveFuse {
         // Fire background prefetch for child dirs not yet in cache.
         for f in files.iter().filter(|f| f.is_folder) {
             if !self.obj.has_cache_entry(&f.id) {
-                self.queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::Low);
+                self.queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::DirPrefetch);
             }
         }
 
@@ -252,14 +285,14 @@ impl Filesystem for GDriveFuse {
             if !self.obj.has_cache_entry(&parent_id) {
                 // Cold miss — start eager first-page fetch before readdir arrives.
                 self.queue
-                    .enqueue(TaskKey::FetchDirFirstPage(parent_id), Priority::High);
+                    .enqueue(TaskKey::FetchDirFirstPage(parent_id), Priority::DirNavigate);
             } else if self.obj.get_cached_dir(&parent_id).is_none() {
-                // Stale entry — trigger background ETag revalidation.
-                // readdir will serve the stale data immediately; once the
-                // worker finishes the cache becomes fresh for the next cycle.
-                self.queue.enqueue(TaskKey::FetchDir(parent_id), Priority::Normal);
+                // Either stale (past TTL) or partial (is_complete = false).
+                // In both cases: trigger an urgent full fetch so readdir
+                // gets complete data without queuing behind prefetch tasks.
+                self.queue.enqueue(TaskKey::FetchDir(parent_id), Priority::DirUrgent);
             }
-            // Fresh — nothing to do.
+            // Fresh and complete — nothing to do.
         }
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
@@ -316,7 +349,7 @@ impl Filesystem for GDriveFuse {
         // Metadata miss — fetch via queue.
         if let Err(e) = self
             .queue
-            .enqueue_and_wait(TaskKey::GetMetadata(file_id.clone()), Priority::High)
+            .enqueue_and_wait(TaskKey::GetMetadata(file_id.clone()), Priority::MetaUrgent)
         {
             error!("getattr ino={}: {}", ino.0, e);
             reply.error(fuser::Errno::EIO);
@@ -416,14 +449,11 @@ impl Filesystem for GDriveFuse {
             return;
         };
 
-        if offset == 0 {
-            let name = self
-                .obj
-                .get_metadata(&file_id)
-                .map(|f| f.name.clone())
-                .unwrap_or_else(|| file_id.clone());
-            info!("read: \"{}\" (id={})", name, file_id);
-        }
+        let file_name = self
+            .obj
+            .get_metadata(&file_id)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| file_id.clone());
 
         // Google Workspace files — synthesise .desktop bytes; no download needed.
         if let Some(info) = self.obj.get_metadata(&file_id) {
@@ -436,63 +466,46 @@ impl Filesystem for GDriveFuse {
             }
         }
 
-        // Content cache hit.
+        // 1. RAM cache hit — small files (≤ CACHE_RAM_MAX_BYTES, i.e. 4 KiB).
         if let Some(content) = self.obj.get_content(&file_id) {
+            debug!("read (ram-cache): \"{}\" offset={} size={}", file_name, offset, size);
             let start = (offset as usize).min(content.len());
             let end = (start + size as usize).min(content.len());
             reply.data(&content[start..end]);
             return;
         }
 
-        // Cache miss — strategy depends on file size:
-        //   ≤ CACHE_MAX_FILE_BYTES (1 MiB) → download fully and cache (fast repeat reads)
-        //   > CACHE_MAX_FILE_BYTES          → HTTP Range request for exactly the requested
-        //     window (no heap allocation for the whole file, no cache pollution)
-        let file_size = self
-            .obj
-            .get_metadata(&file_id)
-            .map(|f| f.size)
-            .unwrap_or(u64::MAX);
+        // 2. Disk cache hit — file was downloaded during a previous read().
+        //    Only the requested slice is read from disk via seek(); the full
+        //    file is never loaded into RAM.
+        if let Some(slice) = self.obj.read_disk_slice(&file_id, offset, size) {
+            debug!("read (disk-cache): \"{}\" offset={} size={}", file_name, offset, size);
+            reply.data(&slice);
+            return;
+        }
 
-        if file_size <= CACHE_MAX_FILE_BYTES {
-            if let Err(e) =
-                self.queue.enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
-            {
-                error!("read ino={}: {}", ino.0, e);
-                reply.error(fuser::Errno::EIO);
-                return;
-            }
-            match self.obj.get_content(&file_id) {
-                Some(content) => {
-                    let start = (offset as usize).min(content.len());
-                    let end = (start + size as usize).min(content.len());
-                    reply.data(&content[start..end]);
-                }
-                None => {
-                    error!("read ino={}: content missing after download", ino.0);
-                    reply.error(fuser::Errno::EIO);
-                }
-            }
+        // 3. Cache miss — download the full file once.  ObjectManager::store_content
+        //    routes the result automatically: ≤ 4 KiB → RAM, > 4 KiB → disk.
+        info!("read (downloading): \"{}\" (id={})", file_name, file_id);
+        if let Err(e) = self.queue.enqueue_and_wait(
+            TaskKey::DownloadFile(file_id.clone()),
+            Priority::FileDownload,
+        ) {
+            error!("read ino={}: download failed: {}", ino.0, e);
+            reply.error(fuser::Errno::EIO);
+            return;
+        }
+
+        // 4. Serve from whichever cache tier the worker populated.
+        if let Some(content) = self.obj.get_content(&file_id) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            reply.data(&content[start..end]);
+        } else if let Some(slice) = self.obj.read_disk_slice(&file_id, offset, size) {
+            reply.data(&slice);
         } else {
-            // Large file — fetch only the requested range.
-            debug!(
-                "read ino={} range offset={} size={} (file_size={})",
-                ino.0, offset, size, file_size
-            );
-            match self.queue.enqueue_and_wait(
-                TaskKey::DownloadFileRange(file_id.clone(), offset, size),
-                Priority::High,
-            ) {
-                Ok(TaskResult::FileContentRange(bytes)) => reply.data(&bytes),
-                Ok(other) => {
-                    error!("read ino={}: unexpected task result {:?}", ino.0, other);
-                    reply.error(fuser::Errno::EIO);
-                }
-                Err(e) => {
-                    error!("read ino={} range: {}", ino.0, e);
-                    reply.error(fuser::Errno::EIO);
-                }
-            }
+            error!("read ino={}: content missing after download", ino.0);
+            reply.error(fuser::Errno::EIO);
         }
     }
 
@@ -684,11 +697,40 @@ impl Filesystem for GDriveFuse {
             .resolve(&files)
             .into_iter()
             .find(|(unique, _)| unique == name_str.as_ref())
-            .map(|(_, f)| f.id.clone());
+            .map(|(_, f)| f.id.clone())
+            // Fallback: if an intermediate `unlink` (overwrite-copy pattern)
+            // wiped the dir-cache via `invalidate_dir`, the pending entry is
+            // still registered in the name-index.
+            .or_else(|| self.obj.lookup_id_by_parent_and_name(&parent_id, &name_str));
 
-        let Some(file_id) = file_id else {
+        let Some(raw_file_id) = file_id else {
             reply.error(fuser::Errno::ENOENT);
             return;
+        };
+
+        // If the source file was just created and its upload is still in
+        // flight, the dir-cache still carries a placeholder ID
+        // ("__pending__<fh>").  Wait up to 60 s for replace_pending_id() to
+        // swap it for the real Drive ID before calling the Drive rename API.
+        let file_id = if raw_file_id.starts_with("__pending__") {
+            let ino = self.obj.get_or_alloc_ino(&raw_file_id);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    error!("rename: timed out waiting for upload of '{}'", raw_file_id);
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                }
+                let current =
+                    self.obj.ino_to_drive_id(ino).unwrap_or_default();
+                if !current.is_empty() && !current.starts_with("__pending__") {
+                    debug!("rename: resolved pending '{}' → '{}'", raw_file_id, current);
+                    break current;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            raw_file_id
         };
 
         let (new_parent_arg, old_parent_arg) = if parent_id != newparent_id {
@@ -751,6 +793,9 @@ impl Filesystem for GDriveFuse {
             is_folder: false,
         };
         self.obj.store_metadata(placeholder.clone());
+        // Inject into the parent dir-cache so rename() can locate the file by
+        // name before the Drive upload has completed.
+        self.obj.inject_pending_into_dir(&parent_id, placeholder.clone());
         let ino = self.obj.get_or_alloc_ino(&pending_id);
 
         self.write_buffers.insert(
@@ -792,13 +837,21 @@ impl Filesystem for GDriveFuse {
                 // Seed the write buffer with the existing content so O_RDWR
                 // overwrites work correctly.
                 if let Some(cached) = self.obj.get_content(&file_id) {
+                    // Small file already in RAM cache.
                     cached
+                } else if let Some(disk) = self.obj.read_full_disk_content(&file_id) {
+                    // Large file on disk cache — load into write buffer.
+                    disk
                 } else {
                     match self
                         .queue
-                        .enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::High)
+                        .enqueue_and_wait(TaskKey::DownloadFile(file_id.clone()), Priority::FileDownload)
                     {
-                        Ok(_) => self.obj.get_content(&file_id).unwrap_or_default(),
+                        Ok(_) => self
+                            .obj
+                            .get_content(&file_id)
+                            .or_else(|| self.obj.read_full_disk_content(&file_id))
+                            .unwrap_or_default(),
                         Err(_) => Vec::new(),
                     }
                 }
@@ -874,6 +927,23 @@ impl Filesystem for GDriveFuse {
         reply.ok();
     }
 
+    // ── fsync ─────────────────────────────────────────────────────────────
+
+    /// Acknowledge `fsync(2)`.  Write data is held in the in-memory
+    /// `write_buffers` map and will be uploaded to Drive on `release`.
+    /// Returning `ok` here satisfies tools (editors, rsync, …) that call
+    /// `fsync` after writing without us needing to start the upload early.
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
     // ── release ────────────────────────────────────────────────────────────
 
     /// Called once when the last reference to an open file handle is dropped.
@@ -896,42 +966,77 @@ impl Filesystem for GDriveFuse {
             return;
         };
 
-        match &entry.file_id {
-            Some(file_id) => {
-                // Update existing Drive file.
-                match self.client.update_file_content(file_id, &entry.content) {
-                    Ok(updated) => {
-                        self.obj.store_metadata(updated);
-                        self.obj.store_content(file_id, entry.content);
-                        reply.ok();
-                    }
-                    Err(e) => {
-                        error!("release: update_file_content '{}': {}", file_id, e);
-                        reply.error(fuser::Errno::EIO);
-                    }
+        // Acknowledge to the kernel immediately.  The Drive upload is
+        // dispatched to the dedicated upload thread pool so tools like `cp`
+        // can queue the next file without waiting for the full HTTP round-trip.
+        reply.ok();
+
+        let WriteEntry { file_id, name, parent_id, content } = entry;
+        let client = Arc::clone(&self.upload_client);
+        let obj = Arc::clone(&self.obj);
+        let active_uploads = Arc::clone(&self.active_uploads);
+        let pending_id = format!("__pending__{}", fh.0);
+
+        // Increment BEFORE sending to the pool so Low-prio workers pause as
+        // soon as we know an upload is incoming, not only when it starts.
+        active_uploads.fetch_add(1, Ordering::Relaxed);
+
+        let task: Box<dyn FnOnce() + Send + 'static> = if let Some(fid) = file_id {
+            Box::new(move || {
+                // Invalidate any cached chunks before the upload so a
+                // concurrent read doesn't serve stale data while the upload
+                // is in progress.
+                obj.invalidate_content(&fid);
+                match client.update_file_content(&fid, content) {
+                    Ok(updated) => obj.store_metadata(updated),
+                    Err(e) => error!("upload: update_file_content '{}': {}", fid, e),
                 }
-            }
-            None => {
-                // New file — upload to Drive and swap the pending placeholder ID.
-                let pending_id = format!("__pending__{}", fh.0);
-                match self
-                    .client
-                    .create_file(&entry.name, &entry.parent_id, &entry.content)
-                {
+                active_uploads.fetch_sub(1, Ordering::Relaxed);
+            })
+        } else {
+            Box::new(move || {
+                let size = content.len() as u64;
+                match client.create_file(&name, &parent_id, content) {
                     Ok(mut new_info) => {
-                        new_info.size = entry.content.len() as u64;
-                        let real_id = new_info.id.clone();
-                        self.obj.replace_pending_id(&pending_id, new_info);
-                        self.obj.invalidate_dir(&entry.parent_id);
-                        self.obj.store_content(&real_id, entry.content);
-                        reply.ok();
+                        if new_info.size == 0 {
+                            new_info.size = size;
+                        }
+                        // Update dir-cache in-place and swap ino maps;
+                        // no extra invalidate needed.
+                        obj.replace_pending_id(&pending_id, &parent_id, new_info);
                     }
                     Err(e) => {
-                        error!("release: create_file '{}': {}", entry.name, e);
-                        reply.error(fuser::Errno::EIO);
+                        error!("upload: create_file '{}': {}", name, e);
+                        // Remove the stale placeholder from cache and dir listing.
+                        obj.remove_pending_from_dir(&parent_id, &pending_id);
                     }
                 }
+                active_uploads.fetch_sub(1, Ordering::Relaxed);
+            })
+        };
+
+        self.upload_tx
+            .send(task)
+            .unwrap_or_else(|_| error!("upload pool channel closed"));
+    }
+
+    // ── destroy ────────────────────────────────────────────────────────────
+
+    /// Called by the FUSE kernel module just before unmounting.
+    ///
+    /// Blocks until every pending background upload has completed so that a
+    /// clean `fusermount3 -u` never abandons in-flight writes.
+    fn destroy(&mut self) {
+        let count = self.active_uploads.load(Ordering::Relaxed);
+        if count > 0 {
+            info!("destroy: waiting for {} pending upload(s) to finish…", count);
+            loop {
+                if self.active_uploads.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
+            info!("destroy: all uploads complete, unmounting");
         }
     }
 
@@ -988,5 +1093,130 @@ impl Filesystem for GDriveFuse {
                 reply.attr(&TTL, &Self::root_attr());
             }
         }
+    }
+}
+
+// ── Unit Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gclient::GClient;
+    use crate::object_manager::ObjectManager;
+    use httpmock::prelude::*;
+    use tempfile::TempDir;
+
+    // ── helpers ───────────────────────────────────────────────────────────
+
+    fn mock_client(server: &MockServer) -> Arc<GClient> {
+        let base_url = format!("{}/drive/v3", server.base_url());
+        Arc::new(GClient::new_for_test(&base_url, "fake-token"))
+    }
+
+    /// Mirror `GDriveFuse::read()` without a live FUSE session.
+    /// Checks RAM cache → disk cache → downloads full file → serves slice.
+    fn simulate_read(
+        obj: &Arc<ObjectManager>,
+        client: &Arc<GClient>,
+        file_id: &str,
+        offset: u64,
+        size: u32,
+    ) -> Vec<u8> {
+        // 1. RAM cache hit.
+        if let Some(content) = obj.get_content(file_id) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            return content[start..end].to_vec();
+        }
+        // 2. Disk cache hit.
+        if let Some(slice) = obj.read_disk_slice(file_id, offset, size) {
+            return slice;
+        }
+        // 3. Cache miss — download full file, route to RAM or disk.
+        let bytes = client.download_file(file_id).expect("download_file failed");
+        obj.store_content(file_id, bytes);
+        // 4. Serve from whichever cache was populated.
+        if let Some(content) = obj.get_content(file_id) {
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            content[start..end].to_vec()
+        } else if let Some(slice) = obj.read_disk_slice(file_id, offset, size) {
+            slice
+        } else {
+            panic!("no content after download for file_id={}", file_id);
+        }
+    }
+
+    fn register_metadata(obj: &Arc<ObjectManager>, file_id: &str, size: u64) {
+        use crate::gclient::FileInfo;
+        obj.store_metadata(FileInfo {
+            id: file_id.to_string(),
+            name: format!("{}.bin", file_id),
+            mime_type: "application/octet-stream".to_string(),
+            size,
+            modified_time: String::new(),
+            is_folder: false,
+        });
+    }
+
+    // ── Disk cache: large files stored on disk, small files in RAM ─────────────
+
+    /// Files > CACHE_RAM_MAX_BYTES (4 KiB) must be written to disk on first
+    /// read and served from disk (via seek+read) on subsequent reads.
+    /// Files ≤ 4 KiB must stay in RAM only.
+    #[test]
+    fn large_file_on_disk_small_file_in_ram() {
+        use crate::object_manager::CACHE_RAM_MAX_BYTES;
+        let tmp = TempDir::new().unwrap();
+
+        // ── Large file (16 KiB > 4 KiB threshold) ───────────────────────────
+        let large_size = (CACHE_RAM_MAX_BYTES * 4) as usize;
+        let large_data: Vec<u8> = (0..large_size).map(|i| (i % 251) as u8).collect();
+
+        let server = MockServer::start();
+        let large_data_clone = large_data.clone();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path_includes("/files/large-pdf")
+                .query_param("alt", "media");
+            then.status(200).body(large_data_clone);
+        });
+
+        let obj = Arc::new(ObjectManager::new_for_test(tmp.path().to_path_buf()));
+        register_metadata(&obj, "large-pdf", large_size as u64);
+        let client = mock_client(&server);
+
+        // Non-sequential reads — each triggers a download on first access.
+        let reads: &[(u64, u32)] = &[
+            (0, 512),
+            (4096, 1024),
+            (large_size as u64 - 100, 100),
+        ];
+        for &(offset, size) in reads {
+            let got = simulate_read(&obj, &client, "large-pdf", offset, size);
+            let s = offset as usize;
+            let e = (s + size as usize).min(large_size);
+            assert_eq!(got, &large_data[s..e], "mismatch offset={} size={}", offset, size);
+        }
+
+        // Large file: on disk, NOT in RAM.
+        assert!(obj.get_content("large-pdf").is_none(), "large file must not occupy RAM");
+        assert!(obj.has_disk_content("large-pdf"), "large file must be on disk");
+
+        // ── Small file (≤ 4 KiB) ───────────────────────────────────────────
+        let small_data = b"tiny file content".to_vec();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path_includes("/files/small-txt")
+                .query_param("alt", "media");
+            then.status(200).body(small_data.clone());
+        });
+        register_metadata(&obj, "small-txt", small_data.len() as u64);
+        let got = simulate_read(&obj, &client, "small-txt", 0, small_data.len() as u32);
+        assert_eq!(got, small_data);
+
+        // Small file: in RAM, NOT on disk.
+        assert!(obj.get_content("small-txt").is_some(), "small file must be in RAM");
+        assert!(!obj.has_disk_content("small-txt"), "small file must NOT be on disk");
     }
 }

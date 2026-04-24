@@ -5,7 +5,7 @@
 
 use crate::auth::Auth;
 use anyhow::Result;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -49,9 +49,6 @@ pub enum ApiOutcome {
     NotModified,
     FileMetadata(FileInfo),
     FileContent(Vec<u8>),
-    /// Result of a Range request — bytes are returned directly to the caller
-    /// and are NOT stored in the content cache.
-    FileContentRange(Vec<u8>),
 }
 
 /// Google Drive API wrapper — thread-safe through `Arc<Auth>`.
@@ -75,6 +72,23 @@ impl GClient {
             base_url: API_BASE.to_string(),
             #[cfg(test)]
             test_token: None,
+        }
+    }
+
+    /// Create a sibling client that shares the same `Auth` (and therefore the
+    /// same token-refresh lock) but owns an **independent** HTTP connection
+    /// pool.
+    ///
+    /// Use this to give dedicated threads (upload workers, navigation workers)
+    /// their own pool so that in-flight downloads never delay other requests
+    /// waiting for a connection.
+    pub fn fork(&self) -> Self {
+        Self {
+            auth: Arc::clone(&self.auth),
+            http: Client::new(),
+            base_url: self.base_url.clone(),
+            #[cfg(test)]
+            test_token: self.test_token.clone(),
         }
     }
 
@@ -332,6 +346,7 @@ impl GClient {
         let token = self.get_token()?;
         let url = format!("{}/files/{}?alt=media", self.base_url, file_id);
 
+        let t0 = std::time::Instant::now();
         let resp = self
             .http
             .get(&url)
@@ -340,17 +355,27 @@ impl GClient {
             .error_for_status()?;
 
         let bytes = resp.bytes()?.to_vec();
-        debug!("download_file('{}'): {} bytes", file_id, bytes.len());
+        debug!("download_file('{}'): {} bytes in {:.1}ms", file_id, bytes.len(), t0.elapsed().as_secs_f64() * 1000.0);
         Ok(bytes)
     }
 
     /// Download a byte range of a file using an HTTP `Range` request.
     ///
-    /// Used for files larger than `SMALL_FILE_MAX_BYTES` so that `fuse_ops::read`
+    /// Download a byte range of a file using an HTTP `Range` request.
+    ///
+    /// Used for files larger than `CACHE_MAX_FILE_BYTES` so that `fuse_ops::read`
     /// serves exactly the bytes requested by the kernel without fetching and
-    /// caching the entire file.  Returns the bytes actually received, which may
-    /// be shorter than `length` at end-of-file (206 Partial Content) or equal
-    /// to the full file when the server ignores the Range header (200 OK).
+    /// caching the entire file.
+    ///
+    /// **Handles both 206 and 200 responses correctly:**
+    /// * `206 Partial Content` — server honoured the Range header; the returned
+    ///   bytes start at `offset`.  Returned as-is.
+    /// * `200 OK` — server ignored the Range header and returned the full file
+    ///   (can happen when a download redirect strips the Range header).  The
+    /// correct window `[offset, offset+length)` is sliced out before returning
+    ///   so callers always receive the bytes they asked for, regardless of which
+    ///   status code was used.
+    #[allow(dead_code)]
     pub fn download_file_range(
         &self,
         file_id: &str,
@@ -363,6 +388,7 @@ impl GClient {
         let last = offset.saturating_add(length as u64).saturating_sub(1);
         let range_header = format!("bytes={}-{}", offset, last);
 
+        let t0 = std::time::Instant::now();
         let resp = self
             .http
             .get(&url)
@@ -371,15 +397,39 @@ impl GClient {
             .send()?
             .error_for_status()?;
 
+        let status = resp.status();
         let bytes = resp.bytes()?.to_vec();
+
+        let result = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            // 206: bytes start at `offset` exactly — return as-is.
+            bytes
+        } else {
+            // 200 OK (or any other 2xx): server returned the full file.
+            // Slice out the requested window so the caller gets the right bytes.
+            warn!(
+                "download_file_range('{}', {}..={}): server returned {} \
+                 instead of 206; slicing [{}..]",
+                file_id, offset, last, status, offset
+            );
+            let start = offset as usize;
+            let end = start.saturating_add(length as usize).min(bytes.len());
+            if start >= bytes.len() {
+                vec![]
+            } else {
+                bytes[start..end].to_vec()
+            }
+        };
+
         info!(
-            "download_file_range('{}', {}..={}): {} bytes",
+            "download_file_range('{}', {}..={}): {} bytes (status={}) in {:.1}ms",
             file_id,
             offset,
             last,
-            bytes.len()
+            result.len(),
+            status,
+            t0.elapsed().as_secs_f64() * 1000.0
         );
-        Ok(bytes)
+        Ok(result)
     }
 
     // ── Write operations ──────────────────────────────────────────────────
@@ -410,7 +460,10 @@ impl GClient {
     }
 
     /// Upload a new file to Google Drive using multipart upload.
-    pub fn create_file(&self, name: &str, parent_id: &str, content: &[u8]) -> Result<FileInfo> {
+    ///
+    /// `content` is moved in and streamed directly into the multipart body
+    /// via a `Cursor` chain — no extra heap copy.
+    pub fn create_file(&self, name: &str, parent_id: &str, content: Vec<u8>) -> Result<FileInfo> {
         let token = self.get_token()?;
         // Derive the upload endpoint from base_url.
         let upload_base = self.base_url.replace("/drive/v3", "/upload/drive/v3");
@@ -420,25 +473,23 @@ impl GClient {
         );
         let boundary = "gdrive_fuse_boundary_4a2f8b1c3e7d9";
         let metadata = serde_json::json!({ "name": name, "parents": [parent_id] });
+        let size = content.len() as u64;
 
-        let mut body: Vec<u8> = Vec::new();
-        body.extend_from_slice(
-            format!(
-                "--{}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n",
-                boundary
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(metadata.to_string().as_bytes());
-        body.extend_from_slice(
-            format!(
-                "\r\n--{}\r\nContent-Type: application/octet-stream\r\n\r\n",
-                boundary
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(content);
-        body.extend_from_slice(format!("\r\n--{}--", boundary).as_bytes());
+        // Build the multipart body as a single contiguous Vec<u8> so reqwest
+        // can set a proper Content-Length header.  Chunked transfer encoding
+        // (the fallback when body size is unknown) causes noticeably higher
+        // latency on the Google Drive upload endpoint.
+        let prefix = format!(
+            "--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n\
+             {meta}\r\n--{b}\r\nContent-Type: application/octet-stream\r\n\r\n",
+            b = boundary,
+            meta = metadata,
+        )
+        .into_bytes();
+        let suffix = format!("\r\n--{}--", boundary).into_bytes();
+        let mut body = prefix;
+        body.extend_from_slice(&content);
+        body.extend_from_slice(&suffix);
 
         let resp = self
             .http
@@ -453,31 +504,34 @@ impl GClient {
             .error_for_status()?;
         let mut info: FileInfo = resp.json()?;
         info.is_folder = false;
-        info.size = content.len() as u64;
+        info.size = size;
         debug!("create_file '{}' in '{}' → id={}", name, parent_id, info.id);
         Ok(info)
     }
 
     /// Update the content of an existing file on Google Drive (media upload).
-    pub fn update_file_content(&self, file_id: &str, content: &[u8]) -> Result<FileInfo> {
+    ///
+    /// `content` is moved in and sent directly as the request body — no copy.
+    pub fn update_file_content(&self, file_id: &str, content: Vec<u8>) -> Result<FileInfo> {
         let token = self.get_token()?;
         let upload_base = self.base_url.replace("/drive/v3", "/upload/drive/v3");
         let url = format!(
             "{}/files/{}?uploadType=media&fields=id,name,mimeType,size,modifiedTime",
             upload_base, file_id
         );
+        let size = content.len() as u64;
         let resp = self
             .http
             .patch(&url)
             .bearer_auth(&token)
             .header("Content-Type", "application/octet-stream")
-            .body(content.to_vec())
+            .body(content)
             .send()?
             .error_for_status()?;
         let mut info: FileInfo = resp.json()?;
         info.is_folder = false;
-        info.size = content.len() as u64;
-        debug!("update_file_content '{}': {} bytes", file_id, content.len());
+        info.size = size;
+        debug!("update_file_content '{}': {} bytes", file_id, size);
         Ok(info)
     }
 

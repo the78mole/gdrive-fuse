@@ -112,7 +112,6 @@ fn main() -> Result<()> {
     let mut mount_options = vec![
         fuser::MountOption::FSName("gdrive-fuse-rs".to_string()),
         fuser::MountOption::DefaultPermissions,
-        fuser::MountOption::RO,
     ];
     if allow_other {
         mount_options.push(fuser::MountOption::AutoUnmount);

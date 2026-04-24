@@ -203,7 +203,7 @@ mod tests {
 
     fn tmp_map() -> DupMapping {
         let dir = tempfile::tempdir().expect("tmp dir");
-        DupMapping::load(dir.into_path().join("dup-mapping"))
+        DupMapping::load(dir.keep().join("dup-mapping"))
     }
 
     #[test]
