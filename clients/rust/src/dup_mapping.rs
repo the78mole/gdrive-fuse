@@ -186,6 +186,7 @@ mod tests {
             mime_type: "application/octet-stream".to_string(),
             size: 0,
             modified_time: String::new(),
+            md5_checksum: None,
             is_folder: false,
         }
     }
@@ -197,6 +198,7 @@ mod tests {
             mime_type: "application/vnd.google-apps.folder".to_string(),
             size: 0,
             modified_time: String::new(),
+            md5_checksum: None,
             is_folder: true,
         }
     }

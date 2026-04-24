@@ -20,9 +20,9 @@
 use crate::dup_mapping::DupMapping;
 use crate::gclient::{FileInfo, GClient};
 use crate::object_manager::{
-    ObjectManager, ROOT_INO, TTL, desktop_content, is_workspace_type,
+    ObjectManager, ROOT_INO, TTL, CACHE_STREAM_THRESHOLD_BYTES, desktop_content, is_workspace_type,
 };
-use crate::queue_manager::{Priority, QueueManager, TaskKey, TaskResult};
+use crate::queue_manager::{Priority, QueueManager, TaskKey};
 use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use fuser::{FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, Request};
@@ -69,6 +69,12 @@ pub struct GDriveFuse {
     /// Number of uploads currently in-flight or queued.  Shared with the
     /// `QueueManager` so Low-prio prefetch workers pause automatically.
     active_uploads: Arc<AtomicUsize>,
+    /// Sender end of the reply-dispatcher pool.  FUSE callbacks that would
+    /// block (cache miss → Drive API call) move their `reply` handle here
+    /// and return immediately, keeping the single FUSE event-loop thread free
+    /// to accept the next kernel request.  The pool thread issues the API
+    /// call and sends the reply when it is ready.
+    reply_tx: Sender<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl GDriveFuse {
@@ -147,6 +153,31 @@ impl GDriveFuse {
             next_fh: AtomicU64::new(1),
             upload_tx,
             active_uploads,
+            reply_tx: {
+                // ── Reply-dispatcher pool ————————————————————————
+                // FUSE callbacks that cannot be served from cache move their
+                // `reply` handle to one of these threads so the FUSE
+                // event-loop thread can immediately pick up the next request
+                // from the kernel.  REPLY_THREADS=16 is enough headroom for
+                // the kernel's typical burst of parallel readdir/lookup/read
+                // calls during an `ls -R` on a large tree.
+                const REPLY_THREADS: usize = 16;
+                let (reply_tx, reply_rx) =
+                    crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+                for i in 0..REPLY_THREADS {
+                    let rx = reply_rx.clone();
+                    std::thread::Builder::new()
+                        .name(format!("gdrive-reply-{}", i))
+                        .spawn(move || {
+                            for task in rx.iter() {
+                                task();
+                            }
+                            debug!("reply-{}: channel closed, exiting", i);
+                        })
+                        .expect("failed to spawn reply dispatcher thread");
+                }
+                reply_tx
+            },
         }
     }
 
@@ -155,26 +186,16 @@ impl GDriveFuse {
     /// Return a fresh directory listing, fetching via the queue if the cache is
     /// missing or expired.
     ///
-    /// **Progressive strategy**: on a cold miss, only the first page is awaited
-    /// (fast, typically < 200 ms).  If more pages exist, a `FetchDirPages`
-    /// continuation is enqueued at Low priority so the partial listing is
-    /// available to `readdir` immediately.  Subsequent `readdir` calls
-    /// (triggered by the file manager's periodic refresh or next `opendir`)
-    /// will see a growing listing until `is_complete` is true.
-    ///
-    /// After every fetch, child directories not yet cached are enqueued for
-    /// background prefetch at Low priority.
-    fn get_dir(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
+    /// Returns `Arc<Vec<FileInfo>>` — cloning the `Arc` is O(1) and zero-copy
+    /// regardless of listing size.
+    fn get_dir(&self, parent_id: &str) -> Option<Arc<Vec<FileInfo>>> {
         // Fast path 1 — entry still within TTL (partial or complete).
         if let Some(files) = self.obj.get_cached_dir(parent_id) {
             return Some(files);
         }
 
-        // Fast path 2 — stale or incomplete entry: serve immediately and fire a
-        // full fetch so the listing is refreshed for the next readdir cycle.
-        // Partial entries (is_complete = false, in-progress first-page fetch)
-        // fall through here and trigger an urgent FetchDir so the complete
-        // listing arrives as soon as possible.
+        // Fast path 2 — stale entry: serve stale data immediately and fire a
+        // background full fetch so the listing is refreshed for the next cycle.
         if let Some(files) = self.obj.get_dir_files(parent_id) {
             let priority = if self.obj.is_dir_complete(parent_id) {
                 Priority::DirPrefetch  // stale-while-revalidate — no urgency
@@ -192,32 +213,13 @@ impl GDriveFuse {
             return Some(files);
         }
 
-        // Complete miss — fetch the first page and block until it arrives.
-        match self
+        // Complete miss — fetch the full listing and block until it arrives.
+        if let Err(e) = self
             .queue
-            .enqueue_and_wait(TaskKey::FetchDirFirstPage(parent_id.to_string()), Priority::DirNavigate)
+            .enqueue_and_wait(TaskKey::FetchDir(parent_id.to_string()), Priority::DirUrgent)
         {
-            Ok(TaskResult::DirListingPartial(Some((page_token, etag)))) => {
-                // More pages exist — enqueue the continuation at DirUrgent (P0)
-                // because the caller is actively navigating this directory and
-                // is waiting for the full listing.  Using DirPrefetch (P3) would
-                // cause the continuation to queue behind potentially many
-                // background prefetch tasks, making the directory appear to hang.
-                self.queue.enqueue(
-                    TaskKey::FetchDirPages(parent_id.to_string(), page_token, etag),
-                    Priority::DirUrgent,
-                );
-            }
-            Ok(TaskResult::DirListing) | Ok(TaskResult::DirListingPartial(None)) => {
-                // Single-page or already complete — nothing more to do.
-            }
-            Err(e) => {
-                error!("get_dir '{}': {}", parent_id, e);
-                return None;
-            }
-            Ok(other) => {
-                error!("get_dir '{}': unexpected task result {:?}", parent_id, other);
-            }
+            error!("get_dir '{}': {}", parent_id, e);
+            return None;
         }
 
         // Re-read regardless of TTL — the worker just stored a (partial) result.
@@ -257,22 +259,95 @@ impl GDriveFuse {
     }
 }
 
+// ── readdir helper ─────────────────────────────────────────────────────────
+
+/// Build the `(inode, kind, name)` entry list from a directory listing and
+/// stream it into a `ReplyDirectory`.
+///
+/// Extracted as a free function so it can be called from both the synchronous
+/// fast-path and the dispatcher-pool closure without capturing `&self`.
+fn serve_readdir(
+    files: &[crate::gclient::FileInfo],
+    ino: INodeNo,
+    parent_id: &str,
+    offset: u64,
+    obj: &ObjectManager,
+    dup_map: &DupMapping,
+    mut reply: ReplyDirectory,
+) {
+    let mut entries: Vec<(u64, FileType, String)> = vec![
+        (ino.0, FileType::Directory, ".".to_string()),
+        (ino.0, FileType::Directory, "..".to_string()),
+    ];
+    for (unique_name, f) in dup_map.resolve(files) {
+        let child_ino = obj.get_or_alloc_ino(&f.id);
+        let kind = if f.is_folder { FileType::Directory } else { FileType::RegularFile };
+        entries.push((child_ino, kind, unique_name));
+    }
+    let total = entries.len().saturating_sub(2);
+    if offset == 0 {
+        let is_complete = obj.is_dir_complete(parent_id);
+        info!(
+            "readdir: {} entries in folder id={} ({})",
+            total,
+            parent_id,
+            if is_complete { "complete" } else { "partial \u{2014} more pages loading" }
+        );
+    }
+    let mut added = 0usize;
+    let mut stopped_at: Option<usize> = None;
+    for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+        if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
+            stopped_at = Some(i);
+            break;
+        }
+        added += 1;
+    }
+    debug!(
+        "readdir ino={} offset={}: added {} entries, stopped_at={:?}",
+        ino.0, offset, added, stopped_at
+    );
+    reply.ok();
+}
+
 // ── Filesystem trait ───────────────────────────────────────────────────────
 
 impl Filesystem for GDriveFuse {
+    // ── init ───────────────────────────────────────────────────────────────
+
+    /// Tell the kernel that this filesystem supports:
+    ///
+    /// - `FUSE_CAP_ASYNC_READ`       — kernel may send multiple read requests
+    ///   concurrently without waiting for each reply.
+    /// - `FUSE_PARALLEL_DIROPS`  — kernel may issue `lookup` and `readdir`
+    ///   operations in parallel within the same directory.
+    ///
+    /// Both capabilities are prerequisites for the reply-dispatcher pool to
+    /// yield a throughput improvement: if the kernel serialises requests the
+    /// pool threads would never execute concurrently.
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> std::io::Result<()> {
+        // Ignore unsupported-flags errors — the kernel simply won't set flags
+        // it does not know.
+        let _ = config.add_capabilities(
+            fuser::InitFlags::FUSE_ASYNC_READ | fuser::InitFlags::FUSE_PARALLEL_DIROPS,
+        );
+        Ok(())
+    }
+
     // ── opendir ────────────────────────────────────────────────────────────
 
     /// Trigger an eager directory fetch so that the subsequent `readdir` can
-    /// return at least the first page immediately.
+    /// return the complete listing immediately.
     ///
-    /// We use `opendir` as the prefetch trigger rather than `readdir` because
-    /// `opendir` is called **before** the GUI shows the busy indicator and
-    /// before any `readdir` calls.  This gives the first-page fetch a head
-    /// start: by the time `readdir` arrives, there is a good chance the partial
+    /// `opendir` fires a full `FetchDir` (all pages, pageSize=1000) on the
+    /// P0 worker before `readdir` arrives.  This gives the fetch a head start:
+    /// for most directories (< 1000 entries) a single Drive API call suffices,
+    /// and by the time `readdir` arrives a few milliseconds later the complete
     /// listing is already in cache.
-    ///
-    /// The busy indicator remains visible because `readdir` still blocks on
-    /// the queue if the cache is not yet warm (< first page arrived).
     fn opendir(
         &self,
         _req: &Request,
@@ -282,14 +357,11 @@ impl Filesystem for GDriveFuse {
     ) {
         debug!("opendir ino={}", ino.0);
         if let Some(parent_id) = self.obj.ino_to_drive_id(ino.0) {
-            if !self.obj.has_cache_entry(&parent_id) {
-                // Cold miss — start eager first-page fetch before readdir arrives.
-                self.queue
-                    .enqueue(TaskKey::FetchDirFirstPage(parent_id), Priority::DirNavigate);
-            } else if self.obj.get_cached_dir(&parent_id).is_none() {
-                // Either stale (past TTL) or partial (is_complete = false).
-                // In both cases: trigger an urgent full fetch so readdir
-                // gets complete data without queuing behind prefetch tasks.
+            // Fire a full directory fetch whenever the cache is absent, stale,
+            // or partial.  Runs on the P0 (DirUrgent) worker, giving the fetch
+            // a head start so readdir finds a complete listing already in cache
+            // when it arrives a few milliseconds later.
+            if self.obj.get_cached_dir(&parent_id).is_none() {
                 self.queue.enqueue(TaskKey::FetchDir(parent_id), Priority::DirUrgent);
             }
             // Fresh and complete — nothing to do.
@@ -306,23 +378,53 @@ impl Filesystem for GDriveFuse {
             reply.error(fuser::Errno::ENOENT);
             return;
         };
-        let name_str = name.to_string_lossy();
+        let name_str = name.to_string_lossy().into_owned();
 
-        // Fetch (or return cached) listing and scan with duplicate-aware names.
+        // Fast path: listing already in cache — serve without touching the queue.
         // The name-index is intentionally bypassed here: it stores raw base
         // names and would return wrong results for suffixed duplicates.
-        let Some(files) = self.get_dir(&parent_id) else {
-            reply.error(fuser::Errno::EIO);
-            return;
-        };
-        for (unique_name, f) in self.dup_map.resolve(&files) {
-            if unique_name == name_str.as_ref() {
-                let ino = self.obj.get_or_alloc_ino(&f.id);
-                reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
-                return;
+        if let Some(files) = self.obj.get_cached_dir(&parent_id) {
+            for (unique_name, f) in self.dup_map.resolve(&files) {
+                if unique_name == name_str.as_str() {
+                    let ino = self.obj.get_or_alloc_ino(&f.id);
+                    reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
+                    return;
+                }
             }
+            reply.error(fuser::Errno::ENOENT);
+            return;
         }
-        reply.error(fuser::Errno::ENOENT);
+
+        // Slow path: cache miss — move reply into the dispatcher pool.
+        let obj = Arc::clone(&self.obj);
+        let queue = Arc::clone(&self.queue);
+        let dup_map = Arc::clone(&self.dup_map);
+        self.reply_tx
+            .send(Box::new(move || {
+                let files = match queue.enqueue_and_wait(
+                    TaskKey::FetchDir(parent_id.clone()),
+                    Priority::DirUrgent,
+                ) {
+                    Ok(_) => obj.get_dir_files(&parent_id),
+                    Err(e) => {
+                        error!("lookup: fetch parent '{}': {}", parent_id, e);
+                        None
+                    }
+                };
+                let Some(files) = files else {
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                };
+                for (unique_name, f) in dup_map.resolve(&files) {
+                    if unique_name == name_str.as_str() {
+                        let ino = obj.get_or_alloc_ino(&f.id);
+                        reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
+                        return;
+                    }
+                }
+                reply.error(fuser::Errno::ENOENT);
+            }))
+            .unwrap_or_else(|_| error!("lookup: reply dispatcher channel closed"));
     }
 
     // ── getattr ────────────────────────────────────────────────────────────
@@ -346,22 +448,30 @@ impl Filesystem for GDriveFuse {
             return;
         }
 
-        // Metadata miss — fetch via queue.
-        if let Err(e) = self
-            .queue
-            .enqueue_and_wait(TaskKey::GetMetadata(file_id.clone()), Priority::MetaUrgent)
-        {
-            error!("getattr ino={}: {}", ino.0, e);
-            reply.error(fuser::Errno::EIO);
-            return;
-        }
-        match self.obj.get_metadata(&file_id) {
-            Some(info) => reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info)),
-            None => {
-                error!("getattr ino={}: metadata missing after fetch", ino.0);
-                reply.error(fuser::Errno::EIO);
-            }
-        }
+        // Metadata miss — dispatch to the reply-dispatcher pool so the FUSE
+        // event-loop thread can immediately accept the next kernel request.
+        let obj = Arc::clone(&self.obj);
+        let queue = Arc::clone(&self.queue);
+        self.reply_tx
+            .send(Box::new(move || {
+                if let Err(e) = queue
+                    .enqueue_and_wait(TaskKey::GetMetadata(file_id.clone()), Priority::MetaUrgent)
+                {
+                    error!("getattr ino={}: {}", ino.0, e);
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                }
+                match obj.get_metadata(&file_id) {
+                    Some(info) => {
+                        reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info))
+                    }
+                    None => {
+                        error!("getattr ino={}: metadata missing after fetch", ino.0);
+                        reply.error(fuser::Errno::EIO);
+                    }
+                }
+            }))
+            .unwrap_or_else(|_| error!("getattr: reply dispatcher channel closed"));
     }
 
     // ── readdir ────────────────────────────────────────────────────────────
@@ -372,7 +482,7 @@ impl Filesystem for GDriveFuse {
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
         debug!("readdir ino={} offset={}", ino.0, offset);
 
@@ -381,52 +491,45 @@ impl Filesystem for GDriveFuse {
             return;
         };
 
-        let Some(files) = self.get_dir(&parent_id) else {
-            error!("readdir ino={}: get_dir returned None for '{}'", ino.0, parent_id);
-            reply.error(fuser::Errno::EIO);
+        // Fast path: listing is cached — serve synchronously without touching
+        // the queue.
+        if let Some(files) = self.obj.get_cached_dir(&parent_id) {
+            serve_readdir(&files, ino, &parent_id, offset, &self.obj, &self.dup_map, reply);
             return;
-        };
-
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino.0, FileType::Directory, ".".to_string()),
-            (ino.0, FileType::Directory, "..".to_string()),
-        ];
-
-        // Google Drive allows multiple files with the same name in one directory.
-        // Duplicate display names in a FUSE readdir response cause the kernel
-        // to return EIO.  Names are resolved via DupMapping which assigns
-        // stable, persistent suffixes: `Bild.jpg` → `Bild (1).jpg`.
-        for (unique_name, f) in self.dup_map.resolve(&files) {
-            let child_ino = self.obj.get_or_alloc_ino(&f.id);
-            let kind = if f.is_folder { FileType::Directory } else { FileType::RegularFile };
-            entries.push((child_ino, kind, unique_name));
         }
 
-        let total = entries.len().saturating_sub(2);
-        let is_complete = self.obj.is_dir_complete(&parent_id);
-        if offset == 0 {
-            info!(
-                "readdir: {} entries in folder id={} ({})",
-                total,
-                parent_id,
-                if is_complete { "complete" } else { "partial \u{2014} more pages loading" }
-            );
-        }
-
-        let mut added = 0usize;
-        let mut stopped_at: Option<usize> = None;
-        for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
-                stopped_at = Some(i);
-                break;
-            }
-            added += 1;
-        }
-        debug!(
-            "readdir ino={} offset={}: added {} entries, stopped_at={:?}",
-            ino.0, offset, added, stopped_at
-        );
-        reply.ok();
+        // Slow path: listing missing, stale, or partial — move the reply handle
+        // into the dispatcher pool so the FUSE event-loop thread stays unblocked.
+        let obj = Arc::clone(&self.obj);
+        let queue = Arc::clone(&self.queue);
+        let dup_map = Arc::clone(&self.dup_map);
+        self.reply_tx
+            .send(Box::new(move || {
+                let files = match queue.enqueue_and_wait(
+                    TaskKey::FetchDir(parent_id.clone()),
+                    Priority::DirUrgent,
+                ) {
+                    Ok(_) => obj.get_dir_files(&parent_id),
+                    Err(e) => {
+                        error!("readdir: fetch '{}': {}", parent_id, e);
+                        reply.error(fuser::Errno::EIO);
+                        return;
+                    }
+                };
+                let Some(files) = files else {
+                    error!("readdir: no files after fetch for '{}'", parent_id);
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                };
+                // Prefetch child dirs not yet in cache.
+                for f in files.iter().filter(|f| f.is_folder) {
+                    if !obj.has_cache_entry(&f.id) {
+                        queue.enqueue(TaskKey::FetchDir(f.id.clone()), Priority::DirPrefetch);
+                    }
+                }
+                serve_readdir(&files, ino, &parent_id, offset, &obj, &dup_map, reply);
+            }))
+            .unwrap_or_else(|_| error!("readdir: reply dispatcher channel closed"));
     }
 
     // ── read ───────────────────────────────────────────────────────────────
@@ -466,6 +569,21 @@ impl Filesystem for GDriveFuse {
             }
         }
 
+        // Early-return EOF guard for regular files: if the kernel requests bytes
+        // at or past the known file size, return an empty slice immediately.
+        // This prevents a pointless cache lookup or full-file download when
+        // offset ≥ file_size.  Per POSIX read(2): returning 0 bytes is the
+        // correct EOF indicator — it is NOT an error.
+        let known_size = self
+            .obj
+            .get_metadata(&file_id)
+            .map(|f| f.size)
+            .unwrap_or(u64::MAX); // unknown size → do not skip
+        if offset >= known_size {
+            reply.data(&[]);
+            return;
+        }
+
         // 1. RAM cache hit — small files (≤ CACHE_RAM_MAX_BYTES, i.e. 4 KiB).
         if let Some(content) = self.obj.get_content(&file_id) {
             debug!("read (ram-cache): \"{}\" offset={} size={}", file_name, offset, size);
@@ -484,28 +602,72 @@ impl Filesystem for GDriveFuse {
             return;
         }
 
-        // 3. Cache miss — download the full file once.  ObjectManager::store_content
-        //    routes the result automatically: ≤ 4 KiB → RAM, > 4 KiB → disk.
-        info!("read (downloading): \"{}\" (id={})", file_name, file_id);
-        if let Err(e) = self.queue.enqueue_and_wait(
-            TaskKey::DownloadFile(file_id.clone()),
-            Priority::FileDownload,
-        ) {
-            error!("read ino={}: download failed: {}", ino.0, e);
-            reply.error(fuser::Errno::EIO);
-            return;
-        }
+        // 3. Cache miss — move the reply handle into the dispatcher pool so the
+        //    FUSE event-loop thread can immediately accept the next kernel request
+        //    while this thread downloads the file from Google Drive.
+        //
+        //    Files larger than CACHE_STREAM_THRESHOLD_BYTES (64 MiB) are served
+        //    via an HTTP Range request that delivers *only* the requested window
+        //    — the full file is never downloaded.  This prevents OOM when the
+        //    user seeks in a multi-gigabyte video while only needing 128 KiB per
+        //    `read()` call.  Range-downloaded bytes are NOT stored in any cache.
+        //
+        //    Smaller files go through the normal full-download → cache → serve
+        //    path so subsequent reads within the same file are served from the
+        //    disk or RAM cache without a network round trip.
+        let file_size = self
+            .obj
+            .get_metadata(&file_id)
+            .map(|f| f.size)
+            .unwrap_or(0);
 
-        // 4. Serve from whichever cache tier the worker populated.
-        if let Some(content) = self.obj.get_content(&file_id) {
-            let start = (offset as usize).min(content.len());
-            let end = (start + size as usize).min(content.len());
-            reply.data(&content[start..end]);
-        } else if let Some(slice) = self.obj.read_disk_slice(&file_id, offset, size) {
-            reply.data(&slice);
+        if file_size > CACHE_STREAM_THRESHOLD_BYTES {
+            info!(
+                "read (stream-range): \"{}\" (id={}) size={} offset={} len={}",
+                file_name, file_id, file_size, offset, size
+            );
+            let client = Arc::clone(&self.client);
+            self.reply_tx
+                .send(Box::new(move || {
+                    match client.download_file_range(&file_id, offset, size) {
+                        Ok(bytes) => reply.data(&bytes),
+                        Err(e) => {
+                            error!(
+                                "read: range download failed for '{}' offset={} len={}: {}",
+                                file_id, offset, size, e
+                            );
+                            reply.error(fuser::Errno::EIO);
+                        }
+                    }
+                }))
+                .unwrap_or_else(|_| error!("read: reply dispatcher channel closed"));
         } else {
-            error!("read ino={}: content missing after download", ino.0);
-            reply.error(fuser::Errno::EIO);
+            info!("read (downloading): \"{}\" (id={})", file_name, file_id);
+            let obj = Arc::clone(&self.obj);
+            let queue = Arc::clone(&self.queue);
+            self.reply_tx
+                .send(Box::new(move || {
+                    if let Err(e) = queue.enqueue_and_wait(
+                        TaskKey::DownloadFile(file_id.clone()),
+                        Priority::FileDownload,
+                    ) {
+                        error!("read: download failed for '{}': {}", file_id, e);
+                        reply.error(fuser::Errno::EIO);
+                        return;
+                    }
+                    // 4. Serve from whichever cache tier the worker populated.
+                    if let Some(content) = obj.get_content(&file_id) {
+                        let start = (offset as usize).min(content.len());
+                        let end = (start + size as usize).min(content.len());
+                        reply.data(&content[start..end]);
+                    } else if let Some(slice) = obj.read_disk_slice(&file_id, offset, size) {
+                        reply.data(&slice);
+                    } else {
+                        error!("read: content missing after download for '{}'", file_id);
+                        reply.error(fuser::Errno::EIO);
+                    }
+                }))
+                .unwrap_or_else(|_| error!("read: reply dispatcher channel closed"));
         }
     }
 
@@ -790,6 +952,7 @@ impl Filesystem for GDriveFuse {
             mime_type: "application/octet-stream".to_string(),
             size: 0,
             modified_time: String::new(),
+            md5_checksum: None,
             is_folder: false,
         };
         self.obj.store_metadata(placeholder.clone());
@@ -837,8 +1000,8 @@ impl Filesystem for GDriveFuse {
                 // Seed the write buffer with the existing content so O_RDWR
                 // overwrites work correctly.
                 if let Some(cached) = self.obj.get_content(&file_id) {
-                    // Small file already in RAM cache.
-                    cached
+                    // Small file already in RAM cache — clone out of Arc for write buffer.
+                    Arc::unwrap_or_clone(cached)
                 } else if let Some(disk) = self.obj.read_full_disk_content(&file_id) {
                     // Large file on disk cache — load into write buffer.
                     disk
@@ -850,6 +1013,7 @@ impl Filesystem for GDriveFuse {
                         Ok(_) => self
                             .obj
                             .get_content(&file_id)
+                            .map(Arc::unwrap_or_clone)
                             .or_else(|| self.obj.read_full_disk_content(&file_id))
                             .unwrap_or_default(),
                         Err(_) => Vec::new(),
@@ -1155,6 +1319,7 @@ mod tests {
             mime_type: "application/octet-stream".to_string(),
             size,
             modified_time: String::new(),
+            md5_checksum: None,
             is_folder: false,
         });
     }

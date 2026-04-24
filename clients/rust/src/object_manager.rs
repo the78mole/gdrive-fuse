@@ -15,14 +15,15 @@
 //! Manager.  Workers call `store_*` methods; FUSE callbacks call `get_*`
 //! methods.
 
+use crate::db_manager::DbManager;
 use crate::gclient::{DirListing, FileInfo};
+use chrono::DateTime;
 use dashmap::DashMap;
 use fuser::{FileAttr, FileType, INodeNo};
 use log::{debug, error, info, warn};
-use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,99 +39,64 @@ pub const ROOT_INO: u64 = 1;
 /// `seek()` + `read_exact()` on the local file; no HTTP request is needed.
 pub const CACHE_RAM_MAX_BYTES: u64 = 4 * 1024; // 4 KiB → RAM
 
-/// Maximum total byte footprint of the in-memory RAM content cache.
-/// Least-recently-used entries are evicted once this limit is exceeded.
-pub const CACHE_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Maximum total byte capacity of the in-memory `moka` content cache.
+/// Moka uses a weigher (bytes) for eviction, so this is a hard byte limit.
+/// Entries are also subject to `CACHE_MOKA_TTL`.
+pub const CACHE_MOKA_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
-// ── ContentCache — byte-bounded LRU ─────────────────────────────────────
+/// Time-to-live for entries in the in-memory `moka` content cache.
+pub const CACHE_MOKA_TTL: Duration = Duration::from_secs(600); // 10 minutes
 
-/// Thread-safe in-memory content cache with byte-granularity FIFO eviction.
+/// Files larger than this threshold are served via HTTP Range requests for
+/// every `read()` call — they are never written to the disk cache.  This
+/// prevents multi-gigabyte downloads when the user only reads a small window
+/// of a large file (e.g. seeking in a video).
+pub const CACHE_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB → streaming
+
+// ── ContentCache — moka-backed TTL cache ──────────────────────────────────
+
+/// Thread-safe in-memory content cache backed by [`moka::sync::Cache`].
 ///
-/// Entries are evicted in insertion order (FIFO) once the total stored bytes
-/// exceed `max_bytes`.  A single mutex protects both the map and the running
-/// byte counter so all operations are atomic.
+/// Properties:
+/// - **Byte-weighted capacity**: total stored bytes never exceed
+///   `CACHE_MOKA_MAX_BYTES` (256 MiB).  Moka uses a TinyLFU admission policy
+///   with SLRU segments — hot entries survive; cold entries are evicted first.
+/// - **TTL**: entries expire 10 minutes after insertion regardless of
+///   access frequency.
+/// - **`Arc<Vec<u8>>` values**: callers receive a reference-counted pointer,
+///   so reads perform a single atomic increment rather than a full byte copy.
 pub struct ContentCache {
-    inner: Mutex<ContentCacheInner>,
-    max_bytes: u64,
-}
-
-struct ContentCacheInner {
-    map: HashMap<String, Vec<u8>>,
-    /// Insertion order used for eviction (FIFO).
-    order: VecDeque<String>,
-    total_bytes: u64,
+    inner: moka::sync::Cache<String, Arc<Vec<u8>>>,
 }
 
 impl ContentCache {
-    pub fn new(max_bytes: u64) -> Self {
-        Self {
-            inner: Mutex::new(ContentCacheInner {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-                total_bytes: 0,
-            }),
-            max_bytes,
-        }
+    pub fn new() -> Self {
+        let cache = moka::sync::Cache::builder()
+            .max_capacity(CACHE_MOKA_MAX_BYTES)
+            .weigher(|_k: &String, v: &Arc<Vec<u8>>| {
+                // Moka weigher must return u32; cap at u32::MAX for safety.
+                v.len().min(u32::MAX as usize) as u32
+            })
+            .time_to_live(CACHE_MOKA_TTL)
+            .build();
+        Self { inner: cache }
     }
 
-    /// Look up a cached entry.
-    pub fn get(&self, file_id: &str) -> Option<Vec<u8>> {
-        self.inner.lock().map.get(file_id).cloned()
+    /// Look up a cached entry.  Returns an `Arc` clone — O(1), no byte copy.
+    pub fn get(&self, file_id: &str) -> Option<Arc<Vec<u8>>> {
+        self.inner.get(file_id)
     }
 
     /// Remove an entry from the cache.
     pub fn remove(&self, file_id: &str) {
-        let mut inner = self.inner.lock();
-        if let Some(old) = inner.map.remove(file_id) {
-            inner.total_bytes = inner.total_bytes.saturating_sub(old.len() as u64);
-            inner.order.retain(|k| k != file_id);
-        }
+        self.inner.invalidate(file_id);
     }
 
-    /// Insert or replace an entry, evicting oldest entries as needed.
+    /// Insert or replace an entry.  Moka handles eviction automatically.
     pub fn insert(&self, file_id: &str, data: Vec<u8>) {
-        let new_size = data.len() as u64;
-        let mut inner = self.inner.lock();
-
-        // Refund the size of an existing entry that will be replaced.
-        if let Some(old) = inner.map.remove(file_id) {
-            inner.total_bytes = inner.total_bytes.saturating_sub(old.len() as u64);
-            // Remove stale entry from the ordering queue.
-            inner.order.retain(|k| k != file_id);
-        }
-
-        // Evict oldest entries until there is room for the new one.
-        while self.max_bytes > 0 && inner.total_bytes + new_size > self.max_bytes {
-            match inner.order.pop_front() {
-                Some(evict_id) => {
-                    if let Some(evicted) = inner.map.remove(&evict_id) {
-                        let freed = evicted.len() as u64;
-                        inner.total_bytes = inner.total_bytes.saturating_sub(freed);
-                        info!("content-cache: evicted '{}' ({} bytes), total now {} bytes",
-                            evict_id, freed, inner.total_bytes);
-                    }
-                }
-                None => break, // cache is empty but new entry is still too big
-            }
-        }
-
-        inner.total_bytes += new_size;
-        inner.order.push_back(file_id.to_string());
-        inner.map.insert(file_id.to_string(), data);
-        debug!("content-cache: stored '{}' ({} bytes), total {} bytes",
-            file_id, new_size, inner.total_bytes);
-    }
-
-    /// Number of entries currently in the cache (for testing).
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.inner.lock().map.len()
-    }
-
-    /// Total bytes currently stored in the cache.
-    #[cfg(test)]
-    pub fn total_bytes(&self) -> u64 {
-        self.inner.lock().total_bytes
+        let len = data.len();
+        self.inner.insert(file_id.to_string(), Arc::new(data));
+        debug!("content-cache: stored '{}' ({} bytes)", file_id, len);
     }
 }
 
@@ -219,7 +185,9 @@ pub enum DirCacheState {
 /// One cached directory listing with explicit state and timestamp.
 #[derive(Clone)]
 pub struct DirEntry {
-    pub files: Vec<FileInfo>,
+    /// Shared, reference-counted listing — `Arc::clone` is O(1) so concurrent
+    /// `readdir` and `lookup` callers never copy the full `Vec`.
+    pub files: Arc<Vec<FileInfo>>,
     pub etag: String,
     pub fetched_at: std::time::Instant,
     pub state: DirCacheState,
@@ -242,43 +210,88 @@ pub struct ObjectManager {
     pub dir_cache: DashMap<String, DirEntry>,
     /// Drive file ID → downloaded bytes (byte-bounded LRU cache, files ≤ 4 KiB).
     pub content_cache: ContentCache,
-    /// Drive file ID → downloaded bytes on disk (`~/.gdrive/cache/<id>`).
+    /// Drive file ID → downloaded bytes on disk (`~/.cache/gdrive-fuse-rs/content/<id>`).
     /// Used for files > CACHE_RAM_MAX_BYTES to avoid RAM pressure.
     disk_cache: DiskCache,
+    /// Optional persistent SQLite-backed cache layer.
+    db: Option<Arc<DbManager>>,
     /// `"{parent_id}:{display_name}"` → `file_id` — populated by every dir
     /// store so `lookup` can resolve in O(1) without scanning the listing.
     pub name_index: DashMap<String, String>,
 }
 
 impl ObjectManager {
+    /// Production constructor — uses XDG cache directory.
+    /// Does **not** require a `DbManager`; the in-memory + disk caches are
+    /// still used.  Pass the returned instance to `QueueManager`; if a
+    /// `DbManager` is also available prefer [`ObjectManager::new_with_db`].
     pub fn new() -> Self {
-        let cache_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".gdrive")
-            .join("cache");
-        Self::new_with_disk_dir(cache_dir)
+        let content_dir = dirs::cache_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+            .join("gdrive-fuse-rs")
+            .join("content");
+        Self::new_with_disk_dir_and_db(content_dir, None)
+    }
+
+    /// Production constructor with an active `DbManager`.
+    ///
+    /// Small-file content (≤ 4 KiB) is written to both moka **and** the
+    /// SQLite BLOB store.  On a cache miss, the DB is consulted before
+    /// returning `None` — surviving a process restart without re-downloading.
+    pub fn new_with_db(db: Arc<DbManager>) -> Self {
+        let content_dir = dirs::cache_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+            .join("gdrive-fuse-rs")
+            .join("content");
+        Self::new_with_disk_dir_and_db(content_dir, Some(db))
     }
 
     /// Test-only constructor: stores disk-cache entries in `cache_dir` instead
-    /// of `~/.gdrive/cache/` so tests stay hermetic.
+    /// of the XDG cache directory so tests stay hermetic.  Creates a
+    /// `DbManager` backed by `cache_dir/metadata.db`.
     #[cfg(test)]
     pub fn new_for_test(cache_dir: PathBuf) -> Self {
-        Self::new_with_disk_dir(cache_dir)
+        let db = DbManager::new(&cache_dir.join("metadata.db")).ok();
+        Self::new_with_disk_dir_and_db(cache_dir, db)
     }
 
-    fn new_with_disk_dir(cache_dir: PathBuf) -> Self {
-        let ino_to_id = DashMap::new();
-        let id_to_ino = DashMap::new();
+    fn new_with_disk_dir_and_db(cache_dir: PathBuf, db: Option<Arc<DbManager>>) -> Self {
+        let ino_to_id: DashMap<u64, String> = DashMap::new();
+        let id_to_ino: DashMap<String, u64> = DashMap::new();
         ino_to_id.insert(ROOT_INO, "root".to_string());
         id_to_ino.insert("root".to_string(), ROOT_INO);
+
+        // Restore inode assignments from the persistent DB (if available) so
+        // that the same Drive file always maps to the same inode across
+        // remounts.  We use `or_insert` (not plain `insert`) to never overwrite
+        // the hardcoded ROOT_INO=1 / "root" mapping.
+        let mut max_restored_ino: u64 = ROOT_INO;
+        if let Some(db_ref) = &db {
+            for (remote_id, inode) in db_ref.load_inode_map() {
+                if inode < ROOT_INO || remote_id.is_empty() {
+                    continue; // skip corrupt rows
+                }
+                id_to_ino.entry(remote_id.clone()).or_insert(inode);
+                ino_to_id.entry(inode).or_insert(remote_id);
+                if inode > max_restored_ino {
+                    max_restored_ino = inode;
+                }
+            }
+            debug!(
+                "object-manager: restored {} inode(s) from DB (next_ino={})",
+                id_to_ino.len().saturating_sub(1), // exclude "root"
+                max_restored_ino + 1
+            );
+        }
         Self {
-            next_ino: AtomicU64::new(2),
+            next_ino: AtomicU64::new(max_restored_ino + 1),
             ino_to_id,
             id_to_ino,
             metadata: DashMap::new(),
             dir_cache: DashMap::new(),
-            content_cache: ContentCache::new(CACHE_MAX_TOTAL_BYTES),
+            content_cache: ContentCache::new(),
             disk_cache: DiskCache::new(cache_dir),
+            db,
             name_index: DashMap::new(),
         }
     }
@@ -309,7 +322,9 @@ impl ObjectManager {
     /// Returns the listing only if the entry is **Fresh and within TTL**.
     /// Returns `None` if missing, stale, or expired — the caller must enqueue
     /// a fetch.
-    pub fn get_cached_dir(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
+    ///
+    /// The returned `Arc` is a pointer copy — O(1), zero allocation.
+    pub fn get_cached_dir(&self, parent_id: &str) -> Option<Arc<Vec<FileInfo>>> {
         let entry = self.dir_cache.get(parent_id)?;
         // Only return the cached listing if it is both fresh (within TTL) AND
         // complete (all pages have been fetched).  A partial listing (is_complete
@@ -319,7 +334,7 @@ impl ObjectManager {
             && entry.fetched_at.elapsed() < TTL
             && entry.is_complete
         {
-            Some(entry.files.clone())
+            Some(Arc::clone(&entry.files))
         } else {
             None
         }
@@ -327,8 +342,8 @@ impl ObjectManager {
 
     /// Returns the listing regardless of TTL — used after a successful fetch
     /// to served the just-stored data.
-    pub fn get_dir_files(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
-        self.dir_cache.get(parent_id).map(|e| e.files.clone())
+    pub fn get_dir_files(&self, parent_id: &str) -> Option<Arc<Vec<FileInfo>>> {
+        self.dir_cache.get(parent_id).map(|e| Arc::clone(&e.files))
     }
 
     /// Returns `true` if any cache entry (stale or fresh) exists for this dir.
@@ -350,41 +365,6 @@ impl ObjectManager {
 
     // ── Directory cache writes ────────────────────────────────────────────
 
-    /// Store the **first page** of a directory listing as a partial result.
-    ///
-    /// The entry is marked `is_complete = false`.  Call [`append_dir_listing`]
-    /// when all remaining pages have been fetched.
-    pub fn store_dir_partial(&self, parent_id: &str, files: Vec<FileInfo>, etag: String) {
-        for f in &files {
-            self.get_or_alloc_ino(&f.id);
-            self.metadata.insert(f.id.clone(), f.clone());
-            self.name_index
-                .insert(make_name_key(parent_id, &f.name, &f.mime_type), f.id.clone());
-        }
-        debug!(
-            "store_dir_partial('{}'): {} files (partial)",
-            parent_id,
-            files.len()
-        );
-        self.dir_cache.insert(
-            parent_id.to_string(),
-            DirEntry {
-                files,
-                etag,
-                fetched_at: std::time::Instant::now(),
-                state: DirCacheState::Fresh,
-                is_complete: false,
-            },
-        );
-    }
-
-    /// Replace the directory listing with a complete result fetched across all
-    /// pages and mark `is_complete = true`.
-    #[allow(dead_code)]
-    pub fn append_dir_listing(&self, parent_id: &str, listing: DirListing) {
-        self.store_dir_listing(parent_id, listing);
-    }
-
     /// Store a fresh directory listing and populate metadata + name index.
     pub fn store_dir_listing(&self, parent_id: &str, listing: DirListing) {
         for f in &listing.files {
@@ -402,7 +382,7 @@ impl ObjectManager {
         self.dir_cache.insert(
             parent_id.to_string(),
             DirEntry {
-                files: listing.files,
+                files: Arc::new(listing.files),
                 etag: listing.etag,
                 fetched_at: std::time::Instant::now(),
                 state: DirCacheState::Fresh,
@@ -415,12 +395,12 @@ impl ObjectManager {
     ///
     /// Returns the (now refreshed) listing, or `None` if the entry is gone
     /// (concurrent eviction — caller should enqueue a cold fetch).
-    pub fn touch_dir(&self, parent_id: &str) -> Option<Vec<FileInfo>> {
+    pub fn touch_dir(&self, parent_id: &str) -> Option<Arc<Vec<FileInfo>>> {
         let mut entry = self.dir_cache.get_mut(parent_id)?;
         entry.fetched_at = std::time::Instant::now();
         entry.state = DirCacheState::Fresh;
         entry.is_complete = true;
-        Some(entry.files.clone())
+        Some(Arc::clone(&entry.files))
     }
 
     /// Returns `true` when the cached listing is complete (all pages fetched).
@@ -441,17 +421,38 @@ impl ObjectManager {
 
     // ── Content cache ─────────────────────────────────────────────────────
 
-    pub fn get_content(&self, file_id: &str) -> Option<Vec<u8>> {
-        self.content_cache.get(file_id)
+    /// Return cached content for `file_id`.
+    ///
+    /// Lookup order:
+    /// 1. In-memory moka cache (O(1) Arc clone).
+    /// 2. SQLite BLOB store (if a `DbManager` is present) — result warms the
+    ///    moka cache to serve subsequent reads without another DB round-trip.
+    /// 3. Returns `None` → caller must download from Drive.
+    pub fn get_content(&self, file_id: &str) -> Option<Arc<Vec<u8>>> {
+        if let Some(arc) = self.content_cache.get(file_id) {
+            return Some(arc);
+        }
+        if let Some(db) = &self.db {
+            if let Some(bytes) = db.get_small_file(file_id) {
+                // Warm moka so future reads skip the DB.
+                self.content_cache.insert(file_id, bytes.clone());
+                return Some(Arc::new(bytes));
+            }
+        }
+        None
     }
 
     /// Route downloaded file content to the right cache tier.
     ///
-    /// - `content.len() ≤ CACHE_RAM_MAX_BYTES` (4 KiB): stored in the in-memory LRU.
-    /// - `content.len() > CACHE_RAM_MAX_BYTES`: written to `~/.gdrive/cache/<id>`
-    ///   and immediately freed from memory.
+    /// - `content.len() ≤ CACHE_RAM_MAX_BYTES` (4 KiB): stored in moka **and**
+    ///   the SQLite BLOB store (when a `DbManager` is present).
+    /// - `content.len() > CACHE_RAM_MAX_BYTES`: written atomically to
+    ///   `~/.cache/gdrive-fuse-rs/content/<id>` and freed from process memory.
     pub fn store_content(&self, file_id: &str, content: Vec<u8>) {
         if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
+            if let Some(db) = &self.db {
+                db.store_small_file(file_id, &content);
+            }
             self.content_cache.insert(file_id, content);
         } else {
             self.disk_cache.insert(file_id, &content);
@@ -501,6 +502,43 @@ impl ObjectManager {
         debug!("remove_metadata('{}')", file_id);
     }
 
+    // ── SyncManager helpers ───────────────────────────────────────────────
+
+    /// Remove the metadata cache entry for `file_id`.
+    ///
+    /// Called by `SyncManager::apply_change` when a file is confirmed deleted
+    /// or when the MD5 has changed and stale metadata must be evicted.
+    pub fn evict_metadata(&self, file_id: &str) {
+        self.metadata.remove(file_id);
+        debug!("evict_metadata('{}')", file_id);
+    }
+
+    /// Remove the disk-cached content file for `file_id`.
+    ///
+    /// Called by `SyncManager::apply_change` after content has changed on
+    /// Drive so the next `read()` re-downloads the current version.
+    pub fn evict_disk_content(&self, file_id: &str) {
+        self.disk_cache.remove(file_id);
+        debug!("evict_disk_content('{}')", file_id);
+    }
+
+    /// Mark every directory listing that contains `file_id` as `Stale`.
+    ///
+    /// The `DirCacheState::Stale` flag causes `get_cached_dir` to return
+    /// `None` on the next access, triggering a conditional re-fetch with
+    /// `If-None-Match` rather than a cold full fetch.
+    ///
+    /// Called by `SyncManager` after detecting a change inside a directory.
+    pub fn mark_dir_stale_for_file(&self, file_id: &str) {
+        for mut entry in self.dir_cache.iter_mut() {
+            if entry.files.iter().any(|f| f.id == file_id) {
+                entry.state = DirCacheState::Stale;
+                debug!("mark_dir_stale_for_file: dir '{}' staled (contains '{}')",
+                       entry.key(), file_id);
+            }
+        }
+    }
+
     /// Look up a file ID by parent directory ID and FUSE display-name.
     ///
     /// Consults the name-index directly, bypassing the dir-cache.  This is
@@ -530,7 +568,7 @@ impl ObjectManager {
             .insert(make_name_key(parent_id, &info.name, &info.mime_type), info.id.clone());
         if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
             if !entry.files.iter().any(|f| f.id == info.id) {
-                entry.files.push(info);
+                Arc::make_mut(&mut entry.files).push(info);
             }
         }
     }
@@ -547,7 +585,7 @@ impl ObjectManager {
             self.ino_to_id.remove(&ino);
         }
         if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
-            entry.files.retain(|f| f.id != old_id);
+            Arc::make_mut(&mut entry.files).retain(|f| f.id != old_id);
         }
         debug!("remove_pending_from_dir: '{}' from parent '{}'", old_id, parent_id);
     }
@@ -578,10 +616,11 @@ impl ObjectManager {
         self.metadata.insert(new_info.id.clone(), new_info.clone());
         // Update dir-cache in-place: swap __pending__ entry for real entry.
         if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
-            if let Some(pos) = entry.files.iter().position(|f| f.id == old_id) {
-                entry.files[pos] = new_info;
+            let files = Arc::make_mut(&mut entry.files);
+            if let Some(pos) = files.iter().position(|f| f.id == old_id) {
+                files[pos] = new_info;
             } else {
-                entry.files.push(new_info);
+                files.push(new_info);
             }
         }
         debug!("replace_pending_id: '{}' → real id stored (parent '{}')", old_id, parent_id);
@@ -590,15 +629,19 @@ impl ObjectManager {
     // ── FileAttr helpers (shared between fuse_ops and here) ───────────────
 
     pub fn make_file_attr(ino: u64, info: &FileInfo) -> FileAttr {
-        let now = SystemTime::now();
+        // Derive a stable mtime/ctime from the Drive-supplied RFC3339 timestamp
+        // (truncated to whole seconds).  Using SystemTime::now() here would
+        // return a different value on every getattr call, causing thumbnailers
+        // and file managers to believe the file is constantly being modified.
+        let mtime = parse_mtime(&info.modified_time);
         if info.is_folder {
             FileAttr {
                 ino: INodeNo(ino),
                 size: 0,
                 blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
+                atime: mtime,
+                mtime,
+                ctime: mtime,
                 crtime: UNIX_EPOCH,
                 kind: FileType::Directory,
                 perm: 0o755,
@@ -620,9 +663,9 @@ impl ObjectManager {
                 ino: INodeNo(ino),
                 size,
                 blocks: size.div_ceil(512),
-                atime: now,
-                mtime: now,
-                ctime: now,
+                atime: mtime,
+                mtime,
+                ctime: mtime,
                 crtime: UNIX_EPOCH,
                 kind: FileType::RegularFile,
                 perm: if is_ws { 0o755 } else { 0o644 },
@@ -638,6 +681,26 @@ impl ObjectManager {
 }
 
 // ── Free helpers (used by ObjectManager and fuse_ops) ─────────────────────
+
+/// Parse a Google Drive RFC3339 timestamp into a stable `SystemTime`.
+///
+/// The sub-second component is **discarded** (truncated to whole seconds) so
+/// that repeated calls with the same string always produce the identical
+/// `SystemTime` value.  Using `SystemTime::now()` in its place would return
+/// a different value on every `getattr` call, causing thumbnailers and file
+/// managers to believe the file is continuously being modified.
+///
+/// Returns `UNIX_EPOCH` when the string is absent or unparseable.
+pub fn parse_mtime(s: &str) -> SystemTime {
+    if s.is_empty() {
+        return UNIX_EPOCH;
+    }
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+        .unwrap_or(UNIX_EPOCH)
+}
 
 /// Build the name-index key for a child entry.
 pub fn make_name_key(parent_id: &str, name: &str, mime: &str) -> String {
@@ -732,6 +795,7 @@ mod tests {
             mime_type: mime.to_string(),
             size,
             modified_time: String::new(),
+            md5_checksum: None,
             is_folder,
         }
     }
@@ -742,7 +806,7 @@ mod tests {
 
     fn stale_entry(files: Vec<FileInfo>, etag: &str) -> DirEntry {
         DirEntry {
-            files,
+            files: Arc::new(files),
             etag: etag.to_string(),
             fetched_at: std::time::Instant::now() - Duration::from_secs(60),
             state: DirCacheState::Fresh,
@@ -918,7 +982,8 @@ mod tests {
     fn store_and_get_content_roundtrip() {
         let obj = ObjectManager::new();
         obj.store_content("f1", vec![1, 2, 3]);
-        assert_eq!(obj.get_content("f1"), Some(vec![1u8, 2, 3]));
+        let got = obj.get_content("f1").expect("should be cached");
+        assert_eq!(*got, vec![1u8, 2, 3]);
     }
 
     #[test]
@@ -928,30 +993,22 @@ mod tests {
     }
 
     #[test]
-    fn store_content_evicts_fifo_on_overflow() {
-        // Build a cache that holds at most 10 bytes.
-        let cache = ContentCache::new(10);
-        // Insert two entries: 4 + 4 = 8 bytes (fits).
+    fn store_content_moka_insert_and_len() {
+        let cache = ContentCache::new();
         cache.insert("a", vec![0u8; 4]);
         cache.insert("b", vec![0u8; 4]);
-        assert_eq!(cache.total_bytes(), 8);
-        // Insert 5 bytes — evicts "a" (oldest, FIFO: 4 bytes freed → 4 + 5 = 9 ≤ 10).
-        cache.insert("c", vec![0u8; 5]);
-        assert!(cache.get("a").is_none(), "a should have been evicted (oldest)");
+        // Both entries are present immediately after insertion.
+        assert!(cache.get("a").is_some());
         assert!(cache.get("b").is_some());
-        assert!(cache.get("c").is_some());
-        assert!(cache.total_bytes() <= 10);
     }
 
     #[test]
-    fn store_content_replace_updates_size() {
-        let cache = ContentCache::new(100);
+    fn store_content_replace_returns_new_value() {
+        let cache = ContentCache::new();
         cache.insert("f1", vec![0u8; 10]);
-        assert_eq!(cache.total_bytes(), 10);
-        // Replace with a smaller value — total should shrink.
         cache.insert("f1", vec![0u8; 3]);
-        assert_eq!(cache.total_bytes(), 3);
-        assert_eq!(cache.len(), 1);
+        let got = cache.get("f1").expect("should be cached");
+        assert_eq!(got.len(), 3);
     }
 
     // ── free helpers ─────────────────────────────────────────────────────

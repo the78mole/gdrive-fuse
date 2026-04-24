@@ -1,7 +1,9 @@
 # gdrive-fuse
 
-A C++20 implementation of a Google Drive FUSE filesystem with modern C++ design,
+- A C++20 implementation of a Google Drive FUSE filesystem with modern C++ design,
 ETag-based caching, and a background change watcher.
+- A Rust implementation with the same architecture and features, designed for
+cross-language comparison and future write-support prototyping.
 
 ## Features
 

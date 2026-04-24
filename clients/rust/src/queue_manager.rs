@@ -62,16 +62,7 @@ use std::time::{Duration, Instant};
 /// Each variant maps to exactly one dedicated worker thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
-    /// P-nav — `FetchDirFirstPage` only: the single HTTP call that delivers
-    /// the first visible batch of entries for a directory the user just
-    /// opened.  Runs on its own dedicated worker so it can never be blocked
-    /// by multi-page continuation tasks (`FetchDirPages`, `FetchDir`) that
-    /// are running concurrently on the P0 worker.
-    DirNavigate,
-    /// P0 — multi-page directory fetches (`FetchDir`, `FetchDirPages`) and
-    /// stale revalidations.  Separate from `DirNavigate` so that a
-    /// long-running multi-page fetch never delays the user's first glimpse
-    /// of a freshly opened directory.
+    /// P0 — full directory fetches (`FetchDir`) and ETag revalidations.
     DirUrgent,
     /// P1 — user-triggered attribute fetch (`getattr` cache miss).
     MetaUrgent,
@@ -88,15 +79,8 @@ pub enum Priority {
 /// Unique identity of a unit of work — used as the deduplication key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaskKey {
-    /// Fetch or revalidate a directory listing (conditional if ETag present).
+    /// Fetch or revalidate a complete directory listing (all pages, conditional if ETag present).
     FetchDir(String),
-    /// Fetch only the **first page** of a directory listing so `readdir` can
-    /// return partial results immediately.  If there are more pages, the
-    /// caller enqueues `FetchDirPages` at `DirPrefetch`.
-    FetchDirFirstPage(String),
-    /// Fetch all remaining pages of a directory listing.
-    /// Fields: `(parent_id, page_token, etag)`.
-    FetchDirPages(String, String, String),
     /// Fetch metadata for a single file.
     GetMetadata(String),
     /// Download the full content of a small file (≤ `CACHE_RAM_MAX_BYTES`).
@@ -110,9 +94,6 @@ pub enum TaskKey {
 #[derive(Clone, Debug)]
 pub enum TaskResult {
     DirListing,
-    /// First page stored; `Some((page_token, etag))` when more pages remain.
-    #[allow(dead_code)]
-    DirListingPartial(Option<(String, String)>),
     NotModified,
     FileMetadata,
     FileContent,
@@ -164,7 +145,6 @@ struct Task {
 
 /// Five-priority queue manager with per-priority dedicated workers.
 pub struct QueueManager {
-    dir_navigate_tx: Sender<Task>,
     dir_urgent_tx: Sender<Task>,
     meta_urgent_tx: Sender<Task>,
     file_tx: Sender<Task>,
@@ -187,7 +167,6 @@ impl QueueManager {
     /// priority.  Each worker gets an independent HTTP connection pool
     /// (forked from `client`).
     pub fn new(object_manager: Arc<ObjectManager>, client: Arc<GClient>) -> Arc<Self> {
-        let (dir_navigate_tx, dir_navigate_rx) = unbounded::<Task>();
         let (dir_urgent_tx, dir_urgent_rx) = unbounded::<Task>();
         let (meta_urgent_tx, meta_urgent_rx) = unbounded::<Task>();
         let (file_tx, file_rx) = unbounded::<Task>();
@@ -199,7 +178,6 @@ impl QueueManager {
         let prefetch_epoch = Arc::new(AtomicU64::new(0));
 
         let qm = Arc::new(QueueManager {
-            dir_navigate_tx,
             dir_urgent_tx,
             meta_urgent_tx,
             file_tx,
@@ -211,14 +189,9 @@ impl QueueManager {
         });
 
         info!(
-            "QueueManager: spawning 6 workers \
-             (p-nav-firstpage, p0-dir-urgent, p1-meta-urgent, p2-file, p3-dir-prefetch, p4-meta-prefetch)"
+            "QueueManager: spawning 5 workers \
+             (p0-dir-urgent, p1-meta-urgent, p2-file, p3-dir-prefetch, p4-meta-prefetch)"
         );
-
-        // P-nav — FetchDirFirstPage: highest priority, never blocked by multi-page tasks
-        spawn_worker("gdrive-p-nav", dir_navigate_rx,
-            Arc::clone(&tracking), Arc::clone(&object_manager),
-            Arc::new(client.fork()), None, None);
 
         // P0 — DirUrgent: dedicated HTTP pool, never paused, no epoch
         spawn_worker("gdrive-p0-dir", dir_urgent_rx,
@@ -268,11 +241,9 @@ impl QueueManager {
     // ── Internal ──────────────────────────────────────────────────────────
 
     fn enqueue_inner(&self, key: TaskKey, priority: Priority, c: Option<Arc<TaskCompletion>>) {
-        // Bump the epoch for any user-initiated navigation event.  This purges
+        // Bump the epoch on every user-initiated navigation event.  This purges
         // stale P3/P4 prefetch tasks that are queued behind the current request.
-        // Both DirNavigate (first-page fetch) and DirUrgent (multi-page fetch)
-        // represent active user navigation.
-        if priority == Priority::DirNavigate || priority == Priority::DirUrgent {
+        if priority == Priority::DirUrgent {
             let prev = self.prefetch_epoch.fetch_add(1, Ordering::Release);
             debug!("enqueue: {:?} — prefetch epoch {} → {}", priority, prev, prev + 1);
         }
@@ -300,7 +271,6 @@ impl QueueManager {
 
         let task = Task { key, enqueued_at: Instant::now(), epoch };
         let _ = match priority {
-            Priority::DirNavigate  => self.dir_navigate_tx.send(task),
             Priority::DirUrgent    => self.dir_urgent_tx.send(task),
             Priority::MetaUrgent   => self.meta_urgent_tx.send(task),
             Priority::FileDownload => self.file_tx.send(task),
@@ -404,34 +374,10 @@ fn run_task(
 
     let task_result = match &api_result {
         Ok(crate::gclient::ApiOutcome::DirListing(listing)) => {
-            if let TaskKey::FetchDir(parent_id) | TaskKey::FetchDirPages(parent_id, _, _) =
-                &task.key
-            {
+            if let TaskKey::FetchDir(parent_id) = &task.key {
                 obj.store_dir_listing(parent_id, listing.clone());
             }
             Ok(TaskResult::DirListing)
-        }
-        Ok(crate::gclient::ApiOutcome::DirListingFirstPage { files, next_page_token, etag }) => {
-            if let TaskKey::FetchDirFirstPage(parent_id) = &task.key {
-                obj.store_dir_partial(parent_id, files.clone(), etag.clone());
-                if let Some(pt) = next_page_token {
-                    info!(
-                        "{}: first page for '{}' ({} files) in {:.1}ms (queue={:.1}ms)",
-                        worker, parent_id, files.len(),
-                        exec_dur.as_secs_f64() * 1000.0,
-                        queue_delay.as_secs_f64() * 1000.0
-                    );
-                    Ok(TaskResult::DirListingPartial(Some((pt.clone(), etag.clone()))))
-                } else {
-                    obj.store_dir_listing(
-                        parent_id,
-                        crate::gclient::DirListing { files: files.clone(), etag: etag.clone() },
-                    );
-                    Ok(TaskResult::DirListing)
-                }
-            } else {
-                Ok(TaskResult::DirListingPartial(None))
-            }
         }
         Ok(crate::gclient::ApiOutcome::NotModified) => {
             if let TaskKey::FetchDir(parent_id) = &task.key {
@@ -492,28 +438,6 @@ fn execute_task(
             }
             client
                 .list_files(parent_id)
-                .map(crate::gclient::ApiOutcome::DirListing)
-                .map_err(|e| e.to_string())
-        }
-        TaskKey::FetchDirFirstPage(parent_id) => client
-            .list_files_first_page(parent_id)
-            .map(|(files, next_page_token, etag)| crate::gclient::ApiOutcome::DirListingFirstPage {
-                files,
-                next_page_token,
-                etag,
-            })
-            .map_err(|e| e.to_string()),
-        TaskKey::FetchDirPages(parent_id, page_token, etag) => {
-            if obj.is_dir_complete(parent_id) {
-                debug!(
-                    "execute_task: FetchDirPages('{}') skipped — cache already complete",
-                    parent_id
-                );
-                return Ok(crate::gclient::ApiOutcome::NotModified);
-            }
-            let accumulator = obj.get_dir_files(parent_id).unwrap_or_default();
-            client
-                .list_files_pages(parent_id, page_token.clone(), accumulator, etag.clone())
                 .map(crate::gclient::ApiOutcome::DirListing)
                 .map_err(|e| e.to_string())
         }
@@ -634,7 +558,7 @@ mod tests {
             Priority::FileDownload,
         );
         assert!(result.is_ok());
-        assert_eq!(obj.get_content("dl-file-id"), Some(b"hello world".to_vec()));
+        assert_eq!(obj.get_content("dl-file-id").as_deref().map(|v| v.as_slice()), Some(b"hello world".as_slice()));
     }
 
     #[test]

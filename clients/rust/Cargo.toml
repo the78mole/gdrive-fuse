@@ -42,6 +42,14 @@ parking_lot = "0.12"
 dashmap = "6"
 crossbeam-channel = "0.5"
 
+# In-memory content cache with TTL and byte-based eviction
+moka = { version = "0.12", features = ["sync"] }
+
+# Persistent SQLite cache (metadata index + small-file BLOBs)
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
 # POSIX UID/GID for FUSE getattr
 libc = "0.2"
 

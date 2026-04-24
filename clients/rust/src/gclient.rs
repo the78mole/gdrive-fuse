@@ -24,8 +24,27 @@ pub struct FileInfo {
     #[serde(default)]
     #[allow(dead_code)]
     pub modified_time: String,
+    /// MD5 checksum of the file content as reported by Google Drive.
+    /// `None` for folders and Google Workspace native files (Docs, Sheets, …)
+    /// which have no binary representation on the server.
+    #[serde(default)]
+    pub md5_checksum: Option<String>,
     #[serde(skip)]
     pub is_folder: bool,
+}
+
+/// A single item from the Drive `/changes` feed.
+///
+/// Returned by [`GClient::get_changes`] for each file or folder that was
+/// created, modified, or deleted since the last poll.
+#[derive(Debug, Clone)]
+pub struct ChangeItem {
+    /// Drive file or folder ID.
+    pub file_id: String,
+    /// `true` when the file was deleted or removed from the corpus.
+    pub removed: bool,
+    /// Updated file metadata.  `None` when `removed` is `true`.
+    pub file: Option<FileInfo>,
 }
 
 /// Result of a directory listing including the ETag for conditional requests.
@@ -39,13 +58,6 @@ pub struct DirListing {
 #[derive(Clone)]
 pub enum ApiOutcome {
     DirListing(DirListing),
-    /// First page of a directory listing.  `next_page_token` is `Some` when
-    /// there are additional pages to fetch.
-    DirListingFirstPage {
-        files: Vec<FileInfo>,
-        next_page_token: Option<String>,
-        etag: String,
-    },
     NotModified,
     FileMetadata(FileInfo),
     FileContent(Vec<u8>),
@@ -170,96 +182,6 @@ impl GClient {
         Ok(DirListing { files: all_files, etag })
     }
 
-    /// Fetch only the **first page** of a directory listing (10 entries).
-    ///
-    /// Uses a small `pageSize=10` so the first results appear in the GUI
-    /// file explorer with minimal latency.  Returns
-    /// `(first_page_files, next_page_token, etag)`.  When
-    /// `next_page_token` is `Some`, the caller should continue with
-    /// [`list_files_pages`] to retrieve the remaining files.  This allows
-    /// FUSE `readdir` to return partial results immediately while background
-    /// workers fetch the rest.
-    pub fn list_files_first_page(
-        &self,
-        parent_id: &str,
-    ) -> Result<(Vec<FileInfo>, Option<String>, String)> {
-        let token = self.get_token()?;
-        let query = format!("'{}' in parents and trashed = false", parent_id);
-        let url = format!(
-            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)&pageSize=10",
-            self.base_url,
-            urlencoding::encode(&query)
-        );
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()?
-            .error_for_status()?;
-
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body: serde_json::Value = resp.json()?;
-        let files = parse_file_list(&body);
-        let next = body["nextPageToken"].as_str().map(|s| s.to_string());
-
-        debug!(
-            "list_files_first_page('{}'): {} files, has_more={}",
-            parent_id,
-            files.len(),
-            next.is_some()
-        );
-        Ok((files, next, etag))
-    }
-
-    /// Fetch all remaining pages of a directory listing starting from
-    /// `page_token`.  Appends to `accumulator` and returns the final merged
-    /// `DirListing`.
-    pub fn list_files_pages(
-        &self,
-        parent_id: &str,
-        mut page_token: String,
-        mut accumulator: Vec<FileInfo>,
-        etag: String,
-    ) -> Result<DirListing> {
-        let token = self.get_token()?;
-        let query = format!("'{}' in parents and trashed = false", parent_id);
-        let base_url = format!(
-            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)&pageSize=1000",
-            self.base_url,
-            urlencoding::encode(&query)
-        );
-
-        loop {
-            let url = format!("{}&pageToken={}", base_url, urlencoding::encode(&page_token));
-            let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(&token)
-                .send()?
-                .error_for_status()?;
-            let body: serde_json::Value = resp.json()?;
-            accumulator.extend(parse_file_list(&body));
-            match body["nextPageToken"].as_str() {
-                Some(pt) => page_token = pt.to_string(),
-                None => break,
-            }
-        }
-
-        debug!(
-            "list_files_pages('{}'): {} files total (all remaining pages)",
-            parent_id,
-            accumulator.len()
-        );
-        Ok(DirListing { files: accumulator, etag })
-    }
-
     /// Conditional GET with If-None-Match. Returns `None` on 304.
     /// Mirrors `GClient::revalidateDir()`.
     ///
@@ -269,7 +191,7 @@ impl GClient {
         let token = self.get_token()?;
         let query = format!("'{}' in parents and trashed = false", parent_id);
         let base_url = format!(
-            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime)&pageSize=1000",
+            "{}/files?q={}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum)&pageSize=1000",
             self.base_url,
             urlencoding::encode(&query)
         );
@@ -324,7 +246,7 @@ impl GClient {
     pub fn get_file_metadata(&self, file_id: &str) -> Result<FileInfo> {
         let token = self.get_token()?;
         let url = format!(
-            "{}/files/{}?fields=id,name,mimeType,size,modifiedTime",
+            "{}/files/{}?fields=id,name,mimeType,size,modifiedTime,md5Checksum",
             self.base_url, file_id
         );
 
@@ -361,21 +283,19 @@ impl GClient {
 
     /// Download a byte range of a file using an HTTP `Range` request.
     ///
-    /// Download a byte range of a file using an HTTP `Range` request.
-    ///
     /// Used for files larger than `CACHE_MAX_FILE_BYTES` so that `fuse_ops::read`
     /// serves exactly the bytes requested by the kernel without fetching and
     /// caching the entire file.
     ///
     /// **Handles both 206 and 200 responses correctly:**
+    ///
     /// * `206 Partial Content` — server honoured the Range header; the returned
     ///   bytes start at `offset`.  Returned as-is.
     /// * `200 OK` — server ignored the Range header and returned the full file
     ///   (can happen when a download redirect strips the Range header).  The
-    /// correct window `[offset, offset+length)` is sliced out before returning
+    ///   correct window `[offset, offset+length)` is sliced out before returning
     ///   so callers always receive the bytes they asked for, regardless of which
     ///   status code was used.
-    #[allow(dead_code)]
     pub fn download_file_range(
         &self,
         file_id: &str,
@@ -548,10 +468,95 @@ impl GClient {
         Ok(())
     }
 
-    /// Rename and/or move a file or folder.
+
+    // ── Changes API ───────────────────────────────────────────────────────
+
+    /// Fetch the Drive `startPageToken` for the changes feed.
     ///
-    /// Supply `new_parent_id` and `old_parent_id` to move to a different
-    /// parent directory; leave both as `None` to rename in place.
+    /// Should be called once on first mount to seed [`DbManager`]'s
+    /// `sync_state` table.  Subsequent polls use the token returned by
+    /// [`get_changes`].
+    pub fn get_start_page_token(&self) -> Result<String> {
+        let token = self.get_token()?;
+        let url = format!("{}/changes/startPageToken", self.base_url);
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        body["startPageToken"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("startPageToken missing from response"))
+    }
+
+    /// Poll the Drive changes feed starting at `page_token`.
+    ///
+    /// Follows `nextPageToken` until all pages are consumed, then returns
+    /// `(changes, new_start_page_token)`.  Pass the new token to the next
+    /// call to receive only incremental updates.
+    ///
+    /// Returns an empty `Vec` when there are no changes since `page_token`.
+    pub fn get_changes(&self, page_token: &str) -> Result<(Vec<ChangeItem>, String)> {
+        let token = self.get_token()?;
+        let mut items: Vec<ChangeItem> = Vec::new();
+        let mut current_token = page_token.to_string();
+        let mut new_token = current_token.clone();
+
+        loop {
+            let url = format!(
+                "{}/changes?pageToken={}&fields=nextPageToken,newStartPageToken,\
+                 changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,md5Checksum))\
+                 &pageSize=1000",
+                self.base_url,
+                urlencoding::encode(&current_token)
+            );
+            let body: serde_json::Value = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()?
+                .error_for_status()?
+                .json()?;
+
+            if let Some(arr) = body["changes"].as_array() {
+                for change in arr {
+                    let file_id = match change["fileId"].as_str() {
+                        Some(id) if !id.is_empty() => id.to_string(),
+                        _ => continue,
+                    };
+                    let removed = change["removed"].as_bool().unwrap_or(false);
+                    let file = if removed {
+                        None
+                    } else {
+                        serde_json::from_value::<FileInfo>(change["file"].clone())
+                            .ok()
+                            .map(|mut info| {
+                                info.is_folder =
+                                    info.mime_type == "application/vnd.google-apps.folder";
+                                info
+                            })
+                    };
+                    items.push(ChangeItem { file_id, removed, file });
+                }
+            }
+
+            if let Some(npt) = body["nextPageToken"].as_str() {
+                current_token = npt.to_string();
+            } else {
+                if let Some(ns) = body["newStartPageToken"].as_str() {
+                    new_token = ns.to_string();
+                }
+                break;
+            }
+        }
+
+        debug!("get_changes: {} change(s), new token set", items.len());
+        Ok((items, new_token))
+    }
+
     pub fn rename_file(
         &self,
         file_id: &str,
