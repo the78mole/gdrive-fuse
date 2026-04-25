@@ -17,17 +17,20 @@
 //! returns the callback re-reads `ObjectManager` — the worker has already
 //! written the result there.
 
+use crate::db_manager::DbManager;
 use crate::dup_mapping::DupMapping;
 use crate::gclient::{FileInfo, GClient};
 use crate::object_manager::{
-    ObjectManager, ROOT_INO, TTL, CACHE_STREAM_THRESHOLD_BYTES, desktop_content, is_workspace_type,
+    ObjectManager, ROOT_INO, TTL, CACHE_STREAM_THRESHOLD_BYTES, INODE_DUPLICATES,
+    desktop_content, is_workspace_type,
 };
 use crate::queue_manager::{Priority, QueueManager, TaskKey};
 use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use fuser::{FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, Request};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::ffi::OsStr;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,8 +46,16 @@ struct WriteEntry {
     /// Drive file ID of an *existing* file being overwritten, or `None` for
     /// newly created files that have not yet been uploaded to Drive.
     file_id: Option<String>,
-    /// Accumulated write data.  Grows on `write`, uploaded on `release`.
+    /// RAM write buffer.  Used for files ≤ `CACHE_STREAM_THRESHOLD_BYTES`.
+    /// Empty when `write_tmp` is `Some`.
     content: Vec<u8>,
+    /// Disk-backed write buffer for large files (> `CACHE_STREAM_THRESHOLD_BYTES`).
+    ///
+    /// When `Some`, all `write()` calls go to this temp file via seek + write;
+    /// `content` stays empty.  The file is removed in `release()`.  Any
+    /// leftover files from a crash are purged at the next mount by
+    /// `ObjectManager::new_with_disk_dir_and_db`.
+    write_tmp: Option<std::path::PathBuf>,
 }
 
 // ── GDriveFuse ─────────────────────────────────────────────────────────────
@@ -75,6 +86,15 @@ pub struct GDriveFuse {
     /// to accept the next kernel request.  The pool thread issues the API
     /// call and sends the reply when it is ready.
     reply_tx: Sender<Box<dyn FnOnce() + Send + 'static>>,
+    /// When present, `release()` uses write-back mode: content is persisted
+    /// to the local cache, `is_dirty` is set in SQLite, and a wakeup ping is
+    /// sent here so `UploadManager` uploads the entry on its next cycle.
+    /// When `None` (no `DbManager`), `release()` falls back to the original
+    /// direct-upload path so behaviour is identical to Phase 3.
+    upload_notify_tx: Option<Sender<()>>,
+    /// SQLite database handle — used for the virtual `/.duplicates` file and
+    /// GC-related queries.  `None` when running without a persistent cache.
+    db: Option<Arc<DbManager>>,
 }
 
 impl GDriveFuse {
@@ -83,6 +103,8 @@ impl GDriveFuse {
         queue: Arc<QueueManager>,
         dup_map: Arc<DupMapping>,
         client: Arc<GClient>,
+        upload_notify_tx: Option<Sender<()>>,
+        db: Option<Arc<DbManager>>,
     ) -> Self {
         // Kick off an eager root prefetch immediately after mount so the root
         // listing is already in cache when the user first runs `ls`.
@@ -178,6 +200,8 @@ impl GDriveFuse {
                 }
                 reply_tx
             },
+            upload_notify_tx,
+            db,
         }
     }
 
@@ -257,6 +281,31 @@ impl GDriveFuse {
             blksize: 512,
         }
     }
+
+    /// Build the `FileAttr` for the virtual `/.duplicates` file.
+    ///
+    /// The file has inode `INODE_DUPLICATES`, mode `0444` (world-readable,
+    /// no write), zero size (content is generated dynamically on `read`).
+    fn duplicates_attr() -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr {
+            ino: INodeNo(INODE_DUPLICATES),
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o444,
+            nlink: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+        }
+    }
 }
 
 // ── readdir helper ─────────────────────────────────────────────────────────
@@ -284,6 +333,10 @@ fn serve_readdir(
         let kind = if f.is_folder { FileType::Directory } else { FileType::RegularFile };
         entries.push((child_ino, kind, unique_name));
     }
+    // Inject the virtual `.duplicates` regular file into the root listing.
+    if ino.0 == ROOT_INO {
+        entries.push((INODE_DUPLICATES, FileType::RegularFile, ".duplicates".to_string()));
+    }
     let total = entries.len().saturating_sub(2);
     if offset == 0 {
         let is_complete = obj.is_dir_complete(parent_id);
@@ -308,6 +361,33 @@ fn serve_readdir(
         ino.0, offset, added, stopped_at
     );
     reply.ok();
+}
+
+// ── Virtual .duplicates ────────────────────────────────────────────────────
+
+/// Generate the text content for the virtual `/.duplicates` file.
+///
+/// Format:
+/// ```text
+/// MD5: a1b2c3...
+///   -> /path/to/file
+///   -> /another/path/copy
+/// ```
+///
+/// Returns a UTF-8 encoded byte vector.  Never panics.
+fn generate_duplicates_report(db: &DbManager) -> Vec<u8> {
+    let duplicates = db.get_md5_duplicates();
+    if duplicates.is_empty() {
+        return b"# No duplicate files found.\n".to_vec();
+    }
+    let mut out = String::new();
+    for (md5, entries) in &duplicates {
+        out.push_str(&format!("MD5: {}\n", md5));
+        for (remote_id, _name) in entries {
+            out.push_str(&format!("  -> {}\n", db.resolve_path(remote_id)));
+        }
+    }
+    out.into_bytes()
 }
 
 // ── Filesystem trait ───────────────────────────────────────────────────────
@@ -374,11 +454,18 @@ impl Filesystem for GDriveFuse {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
         debug!("lookup parent={} name={:?}", parent.0, name);
 
+        let name_str = name.to_string_lossy().into_owned();
+
+        // Virtual read-only file visible in the root directory.
+        if parent.0 == ROOT_INO && name_str == ".duplicates" {
+            reply.entry(&TTL, &Self::duplicates_attr(), Generation(0));
+            return;
+        }
+
         let Some(parent_id) = self.obj.ino_to_drive_id(parent.0) else {
             reply.error(fuser::Errno::ENOENT);
             return;
         };
-        let name_str = name.to_string_lossy().into_owned();
 
         // Fast path: listing already in cache — serve without touching the queue.
         // The name-index is intentionally bypassed here: it stores raw base
@@ -434,6 +521,11 @@ impl Filesystem for GDriveFuse {
 
         if ino.0 == ROOT_INO {
             reply.attr(&TTL, &Self::root_attr());
+            return;
+        }
+
+        if ino.0 == INODE_DUPLICATES {
+            reply.attr(&TTL, &Self::duplicates_attr());
             return;
         }
 
@@ -547,6 +639,19 @@ impl Filesystem for GDriveFuse {
     ) {
         debug!("read ino={} offset={} size={}", ino.0, offset, size);
 
+        // Virtual `.duplicates` file — generate content on the fly from SQLite.
+        if ino.0 == INODE_DUPLICATES {
+            let content = self
+                .db
+                .as_deref()
+                .map(generate_duplicates_report)
+                .unwrap_or_else(|| b"# No database available.\n".to_vec());
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            reply.data(&content[start..end]);
+            return;
+        }
+
         let Some(file_id) = self.obj.ino_to_drive_id(ino.0) else {
             reply.error(fuser::Errno::ENOENT);
             return;
@@ -602,7 +707,23 @@ impl Filesystem for GDriveFuse {
             return;
         }
 
-        // 3. Cache miss — move the reply handle into the dispatcher pool so the
+        // 3. Dirty-file guard: if the file has a pending local modification,
+        //    both cache tiers have already been checked above and missed.
+        //    Never fetch the older version from Drive in this case — the remote
+        //    has stale data.  Return EIO so the caller knows something is wrong.
+        //    (Content eviction while dirty should not happen — CacheCleaner
+        //    skips dirty files — but a manual `rm -rf ~/.cache/...` can trigger
+        //    this path.)
+        if self.obj.is_dirty(&file_id) {
+            error!(
+                "read: dirty file '{}' has no local content — returning EIO",
+                file_id
+            );
+            reply.error(fuser::Errno::EIO);
+            return;
+        }
+
+        // 4. Cache miss — move the reply handle into the dispatcher pool so the
         //    FUSE event-loop thread can immediately accept the next kernel request
         //    while this thread downloads the file from Google Drive.
         //
@@ -870,30 +991,30 @@ impl Filesystem for GDriveFuse {
             return;
         };
 
-        // If the source file was just created and its upload is still in
-        // flight, the dir-cache still carries a placeholder ID
-        // ("__pending__<fh>").  Wait up to 60 s for replace_pending_id() to
-        // swap it for the real Drive ID before calling the Drive rename API.
-        let file_id = if raw_file_id.starts_with("__pending__") {
-            let ino = self.obj.get_or_alloc_ino(&raw_file_id);
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            loop {
-                if std::time::Instant::now() > deadline {
-                    error!("rename: timed out waiting for upload of '{}'", raw_file_id);
-                    reply.error(fuser::Errno::EIO);
-                    return;
+        // If the source is a pending placeholder (file not yet uploaded to
+        // Drive), immediately update the in-memory name/parent so that when
+        // release() fires, write_local_dirty persists the correct destination.
+        // There is no Drive API call to make — the file doesn't exist on Drive
+        // yet, and the final create_file will use the updated name/parent.
+        if raw_file_id.starts_with("__pending__") {
+            let fh_val: u64 = raw_file_id
+                .strip_prefix("__pending__")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(u64::MAX);
+            // Update write buffer so release() uploads with the right name/parent.
+            if let Some(mut wb) = self.write_buffers.get_mut(&fh_val) {
+                wb.name = newname_str.to_string();
+                if parent_id != newparent_id {
+                    wb.parent_id = newparent_id.clone();
                 }
-                let current =
-                    self.obj.ino_to_drive_id(ino).unwrap_or_default();
-                if !current.is_empty() && !current.starts_with("__pending__") {
-                    debug!("rename: resolved pending '{}' → '{}'", raw_file_id, current);
-                    break current;
-                }
-                std::thread::sleep(Duration::from_millis(100));
             }
-        } else {
-            raw_file_id
-        };
+            // Update dir-caches and name-index immediately.
+            self.obj.rename_pending(&parent_id, &newparent_id, &raw_file_id, &newname_str);
+            reply.ok();
+            return;
+        }
+
+        let file_id = raw_file_id;
 
         let (new_parent_arg, old_parent_arg) = if parent_id != newparent_id {
             (Some(newparent_id.as_str()), Some(parent_id.as_str()))
@@ -968,6 +1089,7 @@ impl Filesystem for GDriveFuse {
                 name: name_str,
                 file_id: None,
                 content: Vec::new(),
+                write_tmp: None,
             },
         );
 
@@ -985,6 +1107,12 @@ impl Filesystem for GDriveFuse {
             return;
         }
 
+        // Virtual read-only file — always openable, no Drive ID needed.
+        if ino.0 == INODE_DUPLICATES {
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
+
         let Some(file_id) = self.obj.ino_to_drive_id(ino.0) else {
             reply.error(fuser::Errno::ENOENT);
             return;
@@ -994,11 +1122,90 @@ impl Filesystem for GDriveFuse {
 
         if writable {
             let truncate = (flags.0 & libc::O_TRUNC) != 0;
+
+            let name = self
+                .obj
+                .get_metadata(&file_id)
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+
+            let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+
+            // ── Large-file branch: disk-backed write buffer ─────────────────
+            // For files > CACHE_STREAM_THRESHOLD_BYTES (64 MiB) we avoid
+            // holding the full content in RAM for the duration of the open.
+            // Instead we seed a temp file on disk and use seek+write for every
+            // `write()` call.  Only at `release()` time do we briefly load the
+            // content into RAM to hand off to `write_local_dirty` / upload.
+            //
+            // For O_TRUNC we still create the temp file but start it empty —
+            // no seeding needed.
+            let file_size = self.obj.get_metadata(&file_id).map(|f| f.size).unwrap_or(0);
+            if file_size > CACHE_STREAM_THRESHOLD_BYTES {
+                let tmp_path = self.obj.write_tmp_dir().join(format!("{}.write", fh));
+
+                if truncate {
+                    // O_TRUNC on a large file: create an empty temp file.
+                    if let Err(e) = std::fs::File::create(&tmp_path) {
+                        error!("open: create write-tmp '{}': {}", tmp_path.display(), e);
+                        reply.error(fuser::Errno::EIO);
+                        return;
+                    }
+                } else {
+                    // Non-truncating open: seed the temp file with existing content.
+                    //
+                    // Prefer the disk cache (O(1) kernel copy_file_range, no RAM).
+                    // On a cache miss trigger a full DownloadFile task first (the
+                    // task stores the content to disk) and then copy.
+                    let seeded = self.obj.clone_disk_content_to_path(&file_id, &tmp_path)
+                        || {
+                            self.queue
+                                .enqueue_and_wait(
+                                    TaskKey::DownloadFile(file_id.clone()),
+                                    Priority::FileDownload,
+                                )
+                                .is_ok()
+                                && self.obj.clone_disk_content_to_path(&file_id, &tmp_path)
+                        };
+
+                    if !seeded {
+                        // Content unavailable (e.g. download failed).  Create an
+                        // empty temp file — partial writes will still succeed but
+                        // data outside the written range will be lost.
+                        warn!(
+                            "open: large file '{}' content unavailable, \
+                             write buffer starts empty (data loss possible)",
+                            file_id
+                        );
+                        if let Err(e) = std::fs::File::create(&tmp_path) {
+                            error!("open: create fallback write-tmp '{}': {}", tmp_path.display(), e);
+                            reply.error(fuser::Errno::EIO);
+                            return;
+                        }
+                    }
+                }
+
+                self.write_buffers.insert(
+                    fh,
+                    WriteEntry {
+                        parent_id: String::new(), // not needed for updates
+                        name,
+                        file_id: Some(file_id),
+                        content: Vec::new(),
+                        write_tmp: Some(tmp_path),
+                    },
+                );
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+                return;
+            }
+
+            // ── Normal branch: RAM write buffer (files ≤ 64 MiB) ───────────
             let initial_content = if truncate {
                 Vec::new()
             } else {
-                // Seed the write buffer with the existing content so O_RDWR
-                // overwrites work correctly.
+                // Seed the write buffer with the existing content so partial
+                // O_WRONLY / O_RDWR overwrites preserve the bytes outside the
+                // written range.
                 if let Some(cached) = self.obj.get_content(&file_id) {
                     // Small file already in RAM cache — clone out of Arc for write buffer.
                     Arc::unwrap_or_clone(cached)
@@ -1021,13 +1228,6 @@ impl Filesystem for GDriveFuse {
                 }
             };
 
-            let name = self
-                .obj
-                .get_metadata(&file_id)
-                .map(|f| f.name.clone())
-                .unwrap_or_default();
-
-            let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
             self.write_buffers.insert(
                 fh,
                 WriteEntry {
@@ -1035,6 +1235,7 @@ impl Filesystem for GDriveFuse {
                     name,
                     file_id: Some(file_id),
                     content: initial_content,
+                    write_tmp: None,
                 },
             );
             reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -1067,10 +1268,35 @@ impl Filesystem for GDriveFuse {
 
         let start = offset as usize;
         let end = start + data.len();
-        if end > entry.content.len() {
-            entry.content.resize(end, 0);
+
+        if let Some(ref tmp_path) = entry.write_tmp {
+            // Disk-backed write buffer (large file).
+            match std::fs::OpenOptions::new().write(true).open(tmp_path) {
+                Ok(mut f) => {
+                    if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+                        error!("write: seek in '{}': {}", tmp_path.display(), e);
+                        reply.error(fuser::Errno::EIO);
+                        return;
+                    }
+                    if let Err(e) = f.write_all(data) {
+                        error!("write: write to '{}': {}", tmp_path.display(), e);
+                        reply.error(fuser::Errno::EIO);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("write: open '{}': {}", tmp_path.display(), e);
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                }
+            }
+        } else {
+            // RAM write buffer (small / medium file).
+            if end > entry.content.len() {
+                entry.content.resize(end, 0);
+            }
+            entry.content[start..end].copy_from_slice(data);
         }
-        entry.content[start..end].copy_from_slice(data);
 
         reply.written(data.len() as u32);
     }
@@ -1084,10 +1310,28 @@ impl Filesystem for GDriveFuse {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        // In write-back mode: snapshot the current write buffer to the local
+        // cache so content survives a crash between flush and release.
+        if self.upload_notify_tx.is_some() {
+            if let Some(entry) = self.write_buffers.get(&fh.0) {
+                let effective_id = entry
+                    .file_id
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("__pending__{}", fh.0));
+                if entry.write_tmp.is_some() {
+                    // Disk-backed buffer: content is already on disk, no
+                    // additional snapshot step needed.
+                } else {
+                    // RAM buffer: snapshot to disk.
+                    self.obj.store_content_at_key(&effective_id, &entry.content);
+                }
+            }
+        }
         reply.ok();
     }
 
@@ -1101,10 +1345,26 @@ impl Filesystem for GDriveFuse {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        // Same crash-safety snapshot as flush — use store_content_at_key for
+        // the same reason (dirty flag not yet set in SQLite).
+        if self.upload_notify_tx.is_some() {
+            if let Some(entry) = self.write_buffers.get(&fh.0) {
+                let effective_id = entry
+                    .file_id
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("__pending__{}", fh.0));
+                if entry.write_tmp.is_none() {
+                    // RAM buffer: snapshot to disk for crash-safety.
+                    self.obj.store_content_at_key(&effective_id, &entry.content);
+                }
+                // Disk-backed (write_tmp): content already on disk, no snapshot needed.
+            }
+        }
         reply.ok();
     }
 
@@ -1130,16 +1390,40 @@ impl Filesystem for GDriveFuse {
             return;
         };
 
-        // Acknowledge to the kernel immediately.  The Drive upload is
-        // dispatched to the dedicated upload thread pool so tools like `cp`
-        // can queue the next file without waiting for the full HTTP round-trip.
         reply.ok();
 
-        let WriteEntry { file_id, name, parent_id, content } = entry;
+        let WriteEntry { file_id, name, parent_id, content, write_tmp } = entry;
+        let pending_id = format!("__pending__{}", fh.0);
+        let effective_id = file_id.clone().unwrap_or_else(|| pending_id.clone());
+
+        // For disk-backed large-file handles: read the temp file into memory
+        // and remove it.  From this point on `content` is used uniformly.
+        let content = if let Some(ref tmp_path) = write_tmp {
+            let data = std::fs::read(tmp_path).unwrap_or_else(|e| {
+                error!("release: read write-tmp '{}': {}", tmp_path.display(), e);
+                Vec::new()
+            });
+            let _ = std::fs::remove_file(tmp_path);
+            data
+        } else {
+            content
+        };
+
+        // ── Write-back path (UploadManager present) ────────────────────────
+        // Persist content locally + mark dirty.  The UploadManager wakes up
+        // and uploads asynchronously, so FUSE returns immediately.
+        if let Some(ref notify_tx) = self.upload_notify_tx {
+            self.obj.write_local_dirty(&effective_id, &content, &parent_id, &name);
+            notify_tx
+                .send(())
+                .unwrap_or_else(|_| error!("release: upload_notify channel closed"));
+            return;
+        }
+
+        // ── Direct-upload fallback (no DbManager / write-back disabled) ────
         let client = Arc::clone(&self.upload_client);
         let obj = Arc::clone(&self.obj);
         let active_uploads = Arc::clone(&self.active_uploads);
-        let pending_id = format!("__pending__{}", fh.0);
 
         // Increment BEFORE sending to the pool so Low-prio workers pause as
         // soon as we know an upload is incoming, not only when it starts.
@@ -1232,7 +1516,16 @@ impl Filesystem for GDriveFuse {
         // Truncate the write buffer if a specific file handle is given.
         if let (Some(new_size), Some(fh)) = (size, fh) {
             if let Some(mut entry) = self.write_buffers.get_mut(&fh.0) {
-                entry.content.resize(new_size as usize, 0);
+                if let Some(ref tmp_path) = entry.write_tmp {
+                    // Disk-backed large file: truncate/extend the temp file.
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(tmp_path) {
+                        if let Err(e) = f.set_len(new_size) {
+                            error!("setattr: set_len on '{}': {}", tmp_path.display(), e);
+                        }
+                    }
+                } else {
+                    entry.content.resize(new_size as usize, 0);
+                }
             }
         }
 

@@ -186,6 +186,7 @@ impl SyncManager {
                 id,
                 self.obj.get_or_alloc_ino(id),
                 "", // parent unknown from changes feed
+                "", // name unknown from changes feed
                 new_md5,
                 false,
             )

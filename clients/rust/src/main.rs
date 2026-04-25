@@ -4,6 +4,7 @@
 //! operations object and hands control to the `fuser` library.
 
 mod auth;
+mod cache_cleaner;
 mod db_manager;
 mod dup_mapping;
 mod fuse_ops;
@@ -11,6 +12,7 @@ mod gclient;
 mod object_manager;
 mod queue_manager;
 mod sync_manager;
+mod upload_manager;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -111,9 +113,35 @@ fn main() -> Result<()> {
     info!("dup-mapping: {:?}", dup_map_path);
     let dup_map = Arc::new(dup_mapping::DupMapping::load(dup_map_path));
 
-    // Keep a reference for the SyncManager before moving obj into GDriveFuse.
+    // Keep a reference for the SyncManager and UploadManager before moving
+    // obj into GDriveFuse.
     let obj_for_sync = Arc::clone(&obj);
-    let fs = fuse_ops::GDriveFuse::new(obj, queue, dup_map, Arc::clone(&client));
+    let obj_for_upload = Arc::clone(&obj);
+
+    // Start UploadManager (write-back async uploader) — only when SQLite is present.
+    let upload_notify_tx: Option<crossbeam_channel::Sender<()>> =
+        if let Some(ref db) = maybe_db {
+            let (mgr, tx) = upload_manager::UploadManager::new(
+                Arc::clone(db),
+                obj_for_upload,
+                &client,
+            );
+            Arc::new(mgr).start();
+            Some(tx)
+        } else {
+            None
+        };
+
+    // Start CacheCleaner (LRU disk-cache eviction) — only when SQLite is present.
+    if let Some(ref db) = maybe_db {
+        let cleaner = Arc::new(cache_cleaner::CacheCleaner::new(
+            Arc::clone(db),
+            content_dir.clone(),
+        ));
+        cleaner.start();
+    }
+
+    let fs = fuse_ops::GDriveFuse::new(obj, queue, dup_map, Arc::clone(&client), upload_notify_tx, maybe_db.clone());
 
     // Start background change-watcher (only when SQLite is available).
     if let Some(db) = maybe_db {

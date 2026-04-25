@@ -31,6 +31,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const TTL: Duration = Duration::from_secs(30);
 pub const ROOT_INO: u64 = 1;
+/// Reserved inode for the virtual `/.duplicates` file that reports
+/// all files sharing the same MD5 checksum across the Drive corpus.
+pub const INODE_DUPLICATES: u64 = 3;
 
 /// Files at or below this size are stored in the **RAM** content cache on
 /// first read.  Larger files are written atomically to `~/.gdrive/cache/<id>`
@@ -129,6 +132,19 @@ impl DiskCache {
         self.path_for(file_id).exists()
     }
 
+    /// Rename a cache entry from `old_key` to `new_key` (atomic on same
+    /// filesystem; best-effort otherwise).  Used after upload to migrate
+    /// content from a `file_id`-keyed dirty entry to its MD5 CAS key.
+    fn rename_key(&self, old_key: &str, new_key: &str) {
+        let old_path = self.path_for(old_key);
+        let new_path = self.path_for(new_key);
+        if old_path.exists() {
+            if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                warn!("disk-cache: rename '{}' → '{}': {}", old_key, new_key, e);
+            }
+        }
+    }
+
     /// Read `[offset, offset+size)` bytes from the cached file.
     /// Returns `None` when the file is not in cache.
     /// Returns `Some(empty)` when `offset >= file_len` (beyond EOF).
@@ -218,6 +234,11 @@ pub struct ObjectManager {
     /// `"{parent_id}:{display_name}"` → `file_id` — populated by every dir
     /// store so `lookup` can resolve in O(1) without scanning the listing.
     pub name_index: DashMap<String, String>,
+    /// Directory for disk-backed write buffers used by large-file writable
+    /// `open()` calls (`~/.cache/gdrive-fuse-rs/write-tmp/`).
+    /// Each open handle gets a `<fh>.write` file while the handle is live;
+    /// it is removed in `release()` and any leftovers are purged at startup.
+    write_tmp_dir: PathBuf,
 }
 
 impl ObjectManager {
@@ -256,6 +277,22 @@ impl ObjectManager {
     }
 
     fn new_with_disk_dir_and_db(cache_dir: PathBuf, db: Option<Arc<DbManager>>) -> Self {
+        // Write-tmp dir lives next to the content dir (e.g. write-tmp/ sibling
+        // to content/).  We clean up any *.write files left by a previous crash
+        // so stale large-file write buffers never accumulate on disk.
+        let write_tmp_dir = cache_dir.with_file_name("write-tmp");
+        if let Err(e) = std::fs::create_dir_all(&write_tmp_dir) {
+            warn!("write-tmp: could not create '{}': {}", write_tmp_dir.display(), e);
+        } else if let Ok(rd) = std::fs::read_dir(&write_tmp_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|ext| ext == "write") {
+                    let _ = std::fs::remove_file(&p);
+                    debug!("write-tmp: cleaned up leftover '{}'", p.display());
+                }
+            }
+        }
+
         let ino_to_id: DashMap<u64, String> = DashMap::new();
         let id_to_ino: DashMap<String, u64> = DashMap::new();
         ino_to_id.insert(ROOT_INO, "root".to_string());
@@ -293,7 +330,28 @@ impl ObjectManager {
             disk_cache: DiskCache::new(cache_dir),
             db,
             name_index: DashMap::new(),
+            write_tmp_dir,
         }
+    }
+
+    /// Directory to use for disk-backed write buffers of large files.
+    pub fn write_tmp_dir(&self) -> &std::path::Path {
+        &self.write_tmp_dir
+    }
+
+    /// Copy disk-cached content for `file_id` to `dest` without loading the
+    /// data into process memory (uses the OS `copy_file_range` path on Linux).
+    ///
+    /// Returns `true` when the disk cache contained the file and the copy
+    /// succeeded.  The caller falls back to a full `DownloadFile` task on
+    /// `false`.
+    pub fn clone_disk_content_to_path(&self, file_id: &str, dest: &std::path::Path) -> bool {
+        let key = self.cache_key_for(file_id);
+        let src = self.disk_cache.path_for(&key);
+        if !src.is_file() {
+            return false;
+        }
+        std::fs::copy(&src, dest).is_ok()
     }
 
     // ── Inode management ──────────────────────────────────────────────────
@@ -421,6 +479,29 @@ impl ObjectManager {
 
     // ── Content cache ─────────────────────────────────────────────────────
 
+    /// Determine the cache key for `file_id`.
+    ///
+    /// - If `file_id` starts with `"__pending__"` or the entry is currently
+    ///   dirty in SQLite: use `file_id` directly (the upload has not finished
+    ///   yet, so no server-side MD5 is available).
+    /// - Otherwise: use the Drive-provided `md5_checksum` when available
+    ///   (Content-Addressable Storage — multiple Drive files that share the
+    ///   same bytes share one cache entry).
+    /// - Fallback: `file_id` when no MD5 is known.
+    fn cache_key_for(&self, file_id: &str) -> String {
+        if file_id.starts_with("__pending__") {
+            return file_id.to_string();
+        }
+        if self.is_dirty(file_id) {
+            return file_id.to_string();
+        }
+        self.metadata
+            .get(file_id)
+            .and_then(|f| f.md5_checksum.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| file_id.to_string())
+    }
+
     /// Return cached content for `file_id`.
     ///
     /// Lookup order:
@@ -428,14 +509,19 @@ impl ObjectManager {
     /// 2. SQLite BLOB store (if a `DbManager` is present) — result warms the
     ///    moka cache to serve subsequent reads without another DB round-trip.
     /// 3. Returns `None` → caller must download from Drive.
+    ///
+    /// The cache key is resolved via [`Self::cache_key_for`]: clean files are
+    /// looked up by their MD5 checksum (CAS); dirty/pending files by their
+    /// `file_id`.
     pub fn get_content(&self, file_id: &str) -> Option<Arc<Vec<u8>>> {
-        if let Some(arc) = self.content_cache.get(file_id) {
+        let key = self.cache_key_for(file_id);
+        if let Some(arc) = self.content_cache.get(&key) {
             return Some(arc);
         }
         if let Some(db) = &self.db {
-            if let Some(bytes) = db.get_small_file(file_id) {
+            if let Some(bytes) = db.get_small_file(&key) {
                 // Warm moka so future reads skip the DB.
-                self.content_cache.insert(file_id, bytes.clone());
+                self.content_cache.insert(&key, bytes.clone());
                 return Some(Arc::new(bytes));
             }
         }
@@ -449,33 +535,102 @@ impl ObjectManager {
     /// - `content.len() > CACHE_RAM_MAX_BYTES`: written atomically to
     ///   `~/.cache/gdrive-fuse-rs/content/<id>` and freed from process memory.
     pub fn store_content(&self, file_id: &str, content: Vec<u8>) {
+        self.store_content_bytes(file_id, &content);
+    }
+
+    /// Persist raw bytes to the appropriate cache tier.
+    ///
+    /// Files ≤ `CACHE_RAM_MAX_BYTES` (4 KiB) go into the moka RAM cache **and**
+    /// the SQLite BLOB store.  Larger files are written to the disk cache.
+    /// Used by `flush`, `fsync`, and `write_local_dirty`.
+    ///
+    /// The cache key is resolved via [`Self::cache_key_for`]: clean files with
+    /// a known MD5 are stored under the MD5 hash (CAS deduplication); dirty or
+    /// pending files fall back to `file_id`.
+    pub fn store_content_bytes(&self, file_id: &str, content: &[u8]) {
+        let key = self.cache_key_for(file_id);
         if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
             if let Some(db) = &self.db {
-                db.store_small_file(file_id, &content);
+                db.store_small_file(&key, content);
             }
-            self.content_cache.insert(file_id, content);
+            self.content_cache.insert(&key, content.to_vec());
         } else {
-            self.disk_cache.insert(file_id, &content);
+            self.disk_cache.insert(&key, content);
         }
+    }
+
+    /// Persist raw bytes under an explicit `key`, bypassing CAS key resolution.
+    ///
+    /// Used by write-back paths (`write_local_dirty`, `flush`, `fsync`) where
+    /// the content must always be keyed by `file_id` (the dirty flag in SQLite
+    /// may not be set yet when this is called, so `cache_key_for` would
+    /// incorrectly return the MD5 for a file that is about to become dirty).
+    pub fn store_content_at_key(&self, key: &str, content: &[u8]) {
+        if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
+            if let Some(db) = &self.db {
+                db.store_small_file(key, content);
+            }
+            self.content_cache.insert(key, content.to_vec());
+        } else {
+            self.disk_cache.insert(key, content);
+        }
+    }
+
+    /// Persist content locally **and** mark the file dirty in SQLite.
+    ///
+    /// Called by the FUSE `release()` path when write-back mode is active.
+    /// The `UploadManager` then picks up the dirty entry asynchronously.
+    pub fn write_local_dirty(
+        &self,
+        file_id: &str,
+        content: &[u8],
+        parent_id: &str,
+        name: &str,
+    ) {
+        // Update in-memory file size so `getattr` returns the correct value.
+        if let Some(mut meta) = self.metadata.get_mut(file_id) {
+            meta.size = content.len() as u64;
+        }
+        // Persist content under `file_id` (not MD5) — the dirty flag in SQLite
+        // is not set yet at this point, so `cache_key_for` would incorrectly
+        // resolve to the old MD5.  Always use the explicit file_id key here.
+        self.store_content_at_key(file_id, content);
+        // Persist metadata row and mark dirty in SQLite.
+        if let Some(db) = &self.db {
+            let ino = self.get_or_alloc_ino(file_id);
+            if let Err(e) = db.store_metadata(file_id, ino, parent_id, name, None, true) {
+                error!("write_local_dirty: db.store_metadata '{}': {:#}", file_id, e);
+            }
+        }
+    }
+
+    /// Return `true` when the file has a pending local modification that
+    /// has not yet been uploaded to Google Drive.
+    pub fn is_dirty(&self, file_id: &str) -> bool {
+        self.db
+            .as_ref()
+            .and_then(|db| db.get_metadata(file_id))
+            .map(|m| m.is_dirty)
+            .unwrap_or(false)
     }
 
     /// Returns `true` when the file is present in the disk cache.
     /// Only used in tests to assert correct cache routing.
     #[cfg(test)]
     pub fn has_disk_content(&self, file_id: &str) -> bool {
-        self.disk_cache.contains(file_id)
+        self.disk_cache.contains(&self.cache_key_for(file_id))
     }
 
     /// Read `[offset, offset+size)` bytes from the disk cache.
     /// Returns `None` when the file is not cached on disk.
     pub fn read_disk_slice(&self, file_id: &str, offset: u64, size: u32) -> Option<Vec<u8>> {
-        self.disk_cache.read_slice(file_id, offset, size)
+        self.disk_cache.read_slice(&self.cache_key_for(file_id), offset, size)
     }
 
     /// Read the full disk-cached file into memory.
     /// Use only when seeding a writable `open()` buffer; prefer `read_disk_slice` otherwise.
     pub fn read_full_disk_content(&self, file_id: &str) -> Option<Vec<u8>> {
-        self.disk_cache.read_all(file_id)
+        self.disk_cache.read_all(&self.cache_key_for(file_id))
     }
 
     // ── Write-support helpers ─────────────────────────────────────────────
@@ -483,14 +638,34 @@ impl ObjectManager {
     /// Remove a directory listing from the cache so the next access triggers
     /// a fresh fetch from the Drive API.
     pub fn invalidate_dir(&self, parent_id: &str) {
-        self.dir_cache.remove(parent_id);
+        if let Some((_, entry)) = self.dir_cache.remove(parent_id) {
+            // Prune non-pending name-index entries so that deleted files are no
+            // longer findable via lookup_id_by_parent_and_name.  Pending
+            // placeholders are left in the index because rename() may still
+            // need them while the upload is in flight.
+            for f in entry.files.iter() {
+                if !f.id.starts_with("__pending__") {
+                    let key = make_name_key(parent_id, &f.name, &f.mime_type);
+                    self.name_index.remove(&key);
+                }
+            }
+        }
         debug!("invalidate_dir('{}')", parent_id);
     }
 
     /// Evict cached content for `file_id` from both RAM and disk caches.
+    ///
+    /// Evicts both the CAS key (MD5) and the raw `file_id` so that no stale
+    /// entry is left behind regardless of which key was used for storage.
     pub fn invalidate_content(&self, file_id: &str) {
-        self.content_cache.remove(file_id);
-        self.disk_cache.remove(file_id);
+        let cas_key = self.cache_key_for(file_id);
+        self.content_cache.remove(&cas_key);
+        self.disk_cache.remove(&cas_key);
+        if cas_key != file_id {
+            // Also remove any legacy entry stored directly under file_id.
+            self.content_cache.remove(file_id);
+            self.disk_cache.remove(file_id);
+        }
         debug!("invalidate_content('{}')", file_id);
     }
 
@@ -517,9 +692,39 @@ impl ObjectManager {
     ///
     /// Called by `SyncManager::apply_change` after content has changed on
     /// Drive so the next `read()` re-downloads the current version.
+    /// Evicts both the CAS key (MD5) and the raw `file_id`.
     pub fn evict_disk_content(&self, file_id: &str) {
-        self.disk_cache.remove(file_id);
+        let cas_key = self.cache_key_for(file_id);
+        self.disk_cache.remove(&cas_key);
+        if cas_key != file_id {
+            self.disk_cache.remove(file_id);
+        }
         debug!("evict_disk_content('{}')", file_id);
+    }
+
+    /// Atomically migrate a cache entry from `old_key` to `new_key`.
+    ///
+    /// Called by `UploadManager` after a successful upload to move locally
+    /// persisted content from its write-time key (`file_id` or `__pending__`)
+    /// to the server-confirmed MD5 CAS key.  Handles all three tiers:
+    /// moka RAM cache, SQLite small-file BLOB, and on-disk content file.
+    pub fn migrate_cache_key(&self, old_key: &str, new_key: &str) {
+        if old_key == new_key {
+            return;
+        }
+        // 1. Moka in-memory cache.
+        if let Some(arc) = self.content_cache.get(old_key) {
+            let data = Arc::unwrap_or_clone(arc);
+            self.content_cache.insert(new_key, data);
+            self.content_cache.remove(old_key);
+        }
+        // 2. SQLite small-files BLOB store.
+        if let Some(db) = &self.db {
+            db.migrate_small_file_key(old_key, new_key);
+        }
+        // 3. On-disk content cache.
+        self.disk_cache.rename_key(old_key, new_key);
+        debug!("migrate_cache_key: '{}' → '{}'", old_key, new_key);
     }
 
     /// Mark every directory listing that contains `file_id` as `Stale`.
@@ -571,6 +776,56 @@ impl ObjectManager {
                 Arc::make_mut(&mut entry.files).push(info);
             }
         }
+    }
+
+    /// Rename (and optionally move) a pending placeholder without removing it.
+    ///
+    /// Updates the in-memory metadata name, name-index, and dir-cache so that
+    /// `readdir` and `lookup` immediately reflect the new name/parent.
+    /// The `WriteEntry` in `FuseOps::write_buffers` must be updated separately
+    /// so `release()` uploads the file with the correct destination.
+    pub fn rename_pending(
+        &self,
+        old_parent_id: &str,
+        new_parent_id: &str,
+        pending_id: &str,
+        new_name: &str,
+    ) {
+        // 1. Remove old name-index entry.
+        if let Some(meta) = self.metadata.get(pending_id) {
+            let old_key = make_name_key(old_parent_id, &meta.name, &meta.mime_type);
+            self.name_index.remove(&old_key);
+        }
+        // 2. Update the placeholder metadata name.
+        if let Some(mut meta) = self.metadata.get_mut(pending_id) {
+            meta.name = new_name.to_string();
+        }
+        // 3. Add new name-index entry.
+        if let Some(meta) = self.metadata.get(pending_id) {
+            let new_key = make_name_key(new_parent_id, new_name, &meta.mime_type);
+            self.name_index.insert(new_key, pending_id.to_string());
+        }
+        // 4. Move between dir-caches if the parent changed; rename in-place otherwise.
+        if old_parent_id != new_parent_id {
+            if let Some(mut entry) = self.dir_cache.get_mut(old_parent_id) {
+                Arc::make_mut(&mut entry.files).retain(|f| f.id != pending_id);
+            }
+            if let Some(meta) = self.metadata.get(pending_id) {
+                let info = meta.clone();
+                if let Some(mut entry) = self.dir_cache.get_mut(new_parent_id) {
+                    Arc::make_mut(&mut entry.files).push(info);
+                }
+            }
+        } else if let Some(mut entry) = self.dir_cache.get_mut(old_parent_id) {
+            let files = Arc::make_mut(&mut entry.files);
+            if let Some(f) = files.iter_mut().find(|f| f.id == pending_id) {
+                f.name = new_name.to_string();
+            }
+        }
+        debug!(
+            "rename_pending: '{}' → '{}' (parent '{}' → '{}')",
+            pending_id, new_name, old_parent_id, new_parent_id
+        );
     }
 
     /// Remove a pending placeholder from the parent's dir-cache (upload
