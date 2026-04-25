@@ -149,30 +149,46 @@ impl UploadManager {
         if is_new {
             // ── New file: create on Drive ──────────────────────────────────
 
+            // Re-read the most up-to-date name and parent_id from SQLite right
+            // before the API call.  The list_dirty_entries() snapshot may be
+            // stale: Chrome's typical pattern is
+            //   release("file.crdownload") → rename("file.crdownload", "file.pdf")
+            // rename_pending() updates SQLite, but if the UploadManager woke
+            // up between write_local_dirty() and rename_pending(), its snapshot
+            // still shows "file.crdownload".  Uploading with the wrong name
+            // causes Drive to create "file.crdownload" (instead of "file.pdf")
+            // and replace_pending_id() then stores the wrong name back into the
+            // in-memory caches, making the real PDF invisible after a refresh.
+            let (upload_name, upload_parent) = if let Some(fresh) = self.db.get_metadata(remote_id) {
+                (fresh.name, fresh.parent_id)
+            } else {
+                (meta.name.clone(), meta.parent_id.clone())
+            };
+
             // Guard: parent folder is itself still pending (not yet uploaded).
             // Uploading now would send a fake "__pending__<N>" folder ID to
             // Drive and always fail.  Defer until the parent has been resolved.
-            if meta.parent_id.starts_with("__pending__") {
+            if upload_parent.starts_with("__pending__") {
                 warn!(
                     "upload-manager: deferring '{}' — parent '{}' is still pending",
-                    meta.name, meta.parent_id
+                    upload_name, upload_parent
                 );
                 return;
             }
 
             debug!(
                 "upload-manager: creating '{}' in parent '{}'",
-                meta.name, meta.parent_id
+                upload_name, upload_parent
             );
             let size = content.len() as u64;
-            match self.client.create_file(&meta.name, &meta.parent_id, content) {
+            match self.client.create_file(&upload_name, &upload_parent, content) {
                 Ok(mut new_info) => {
                     if new_info.size == 0 {
                         new_info.size = size;
                     }
                     info!(
                         "upload-manager: created '{}' → id={}",
-                        meta.name, new_info.id
+                        upload_name, new_info.id
                     );
                     // Replace the pending ID with the real Drive ID everywhere.
                     self.db.finalize_new_file(
@@ -187,7 +203,7 @@ impl UploadManager {
                             self.obj.migrate_cache_key(remote_id, md5);
                         }
                     }
-                    self.obj.replace_pending_id(remote_id, &meta.parent_id, new_info);
+                    self.obj.replace_pending_id(remote_id, &upload_parent, new_info);
                 }
                 Err(e) => {
                     if is_http_not_found(&e) {
@@ -198,14 +214,14 @@ impl UploadManager {
                         error!(
                             "upload-manager: create_file '{}': parent '{}' not found on \
                              Drive (404) — abandoning unrecoverable dirty entry",
-                            meta.name, meta.parent_id
+                            upload_name, upload_parent
                         );
                         self.db.abandon_dirty_entry(remote_id);
-                        self.obj.remove_pending_from_dir(&meta.parent_id, remote_id);
+                        self.obj.remove_pending_from_dir(&upload_parent, remote_id);
                     } else {
                         error!(
                             "upload-manager: create_file '{}': {:#} — will retry",
-                            meta.name, e
+                            upload_name, e
                         );
                         // dirty flag intentionally not cleared: retry on next cycle
                     }
