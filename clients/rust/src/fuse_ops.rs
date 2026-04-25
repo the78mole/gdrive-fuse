@@ -1482,16 +1482,30 @@ impl Filesystem for GDriveFuse {
         // Persist content locally + mark dirty.  The UploadManager wakes up
         // and uploads asynchronously, so FUSE returns immediately.
         if let Some(ref notify_tx) = self.upload_notify_tx {
-            // If parent_id is empty (write buffer was opened via open() on a
-            // pending file before this fix), recover from pending_parents.
-            let effective_parent = if parent_id.is_empty() && file_id.is_none() {
-                self.obj
+            // For pending IDs, resolve the current name and parent from the
+            // live in-memory metadata.  Chrome's typical rename-after-release
+            // sequence can produce:
+            //   rename(.crdownload → .pdf) → rename_pending() updates metadata + SQLite
+            //   release(fh=2, 100 KB)      → entry.name is still ".crdownload" (stale)
+            //   write_local_dirty(name=".crdownload") → OVERWRITES SQLite back to wrong name
+            //
+            // rename_pending() always updates self.obj.metadata[pending_id].name, so
+            // reading from there gives the authoritative current name.
+            let (effective_name, effective_parent) = if file_id.is_none() {
+                let live_name = self.obj
+                    .metadata
+                    .get(&effective_id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or(name);
+                let live_parent = self.obj
                     .get_pending_parent(&effective_id)
-                    .unwrap_or_default()
+                    .unwrap_or(parent_id);
+                (live_name, live_parent)
             } else {
-                parent_id
+                // Real Drive ID — parent_id and name are authoritative from the write buffer.
+                (name, parent_id)
             };
-            self.obj.write_local_dirty(&effective_id, &content, &effective_parent, &name);
+            self.obj.write_local_dirty(&effective_id, &content, &effective_parent, &effective_name);
             notify_tx
                 .send(())
                 .unwrap_or_else(|_| error!("release: upload_notify channel closed"));
