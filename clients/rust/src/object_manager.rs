@@ -614,11 +614,18 @@ impl ObjectManager {
             }
             self.content_cache.insert(&key, content.to_vec());
         } else {
-            // Evict any stale moka entry so get_content() does not return stale
-            // small-file bytes while the real (larger) content lives on disk.
-            // This covers the pattern: flush(0 bytes) → moka[key]=[] → then
-            // flush(100 KB) → without eviction moka still returns [] on the
-            // next get_content() call, causing UploadManager to upload 0 bytes.
+            // Content has grown past the small-file threshold.  Evict both the
+            // moka entry AND the SQLite BLOB so that get_content() does not
+            // return stale small-file bytes (e.g. a 0-byte BLOB written by an
+            // earlier flush() call) while the real content lives on disk.
+            //
+            // Scenario that this prevents:
+            //   flush(fh=1, 0 B)  → SQLite BLOB[key] = []  ← stale 0 B
+            //   flush(fh=2, 100K) → moka evicted, disk[key]=100K
+            //                       without this: get_content() hits BLOB → 0 B!
+            if let Some(db) = &self.db {
+                db.delete_small_file(&key);
+            }
             self.content_cache.remove(&key);
             self.disk_cache.insert(&key, content);
         }
@@ -637,7 +644,12 @@ impl ObjectManager {
             }
             self.content_cache.insert(key, content.to_vec());
         } else {
-            // Evict any stale moka entry (same reason as in store_content_bytes).
+            // Evict stale moka entry AND SQLite BLOB (same reason as in
+            // store_content_bytes — belt-and-suspenders against stale 0-byte
+            // BLOB that get_content() would otherwise return authoritatively).
+            if let Some(db) = &self.db {
+                db.delete_small_file(key);
+            }
             self.content_cache.remove(key);
             self.disk_cache.insert(key, content);
         }

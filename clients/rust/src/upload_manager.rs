@@ -134,7 +134,7 @@ impl UploadManager {
         let is_new = remote_id.starts_with("__pending__");
 
         // Load the locally persisted content from whichever cache tier holds it.
-        let content = if let Some(arc) = self.obj.get_content(remote_id) {
+        let mut content = if let Some(arc) = self.obj.get_content(remote_id) {
             Arc::unwrap_or_clone(arc)
         } else if let Some(data) = self.obj.read_full_disk_content(remote_id) {
             data
@@ -145,6 +145,34 @@ impl UploadManager {
             );
             return;
         };
+
+        // Belt-and-suspenders: get_content() returns the SQLite BLOB when moka
+        // misses, but an earlier flush() with 0-byte content may have stored a
+        // stale empty BLOB before the real content arrived.  The store_content_at_key
+        // fix should normally clear it, but as a safety net: if content is empty
+        // yet the disk cache has data, use the disk copy instead.
+        if content.is_empty() {
+            if let Some(disk_data) = self.obj.read_full_disk_content(remote_id) {
+                if !disk_data.is_empty() {
+                    debug!(
+                        "upload-manager: overriding empty get_content() with disk data ({} bytes) for '{}'",
+                        disk_data.len(), remote_id
+                    );
+                    content = disk_data;
+                }
+            }
+            // For new files: if no real content found anywhere, a genuine
+            // 0-byte write (or a race where write_local_dirty hasn't finished
+            // yet) landed here.  Defer until the next poll cycle rather than
+            // uploading an empty file.
+            if is_new && content.is_empty() {
+                debug!(
+                    "upload-manager: deferring new '{}' ('{}'): no content found yet — retrying on next cycle",
+                    remote_id, meta.name
+                );
+                return;
+            }
+        }
 
         if is_new {
             // ── New file: create on Drive ──────────────────────────────────

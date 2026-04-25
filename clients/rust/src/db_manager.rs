@@ -393,6 +393,20 @@ impl DbManager {
         }
     }
 
+    /// Remove a small-file BLOB entry by key.
+    ///
+    /// Called when content for a key grows beyond `CACHE_RAM_MAX_BYTES` so
+    /// that a stale 0-byte BLOB written by an earlier flush() cannot shadow
+    /// the correct disk-cache content in `get_content()`.
+    pub fn delete_small_file(&self, key: &str) {
+        if let Ok(conn) = self.pool.get() {
+            let _ = conn.execute(
+                "DELETE FROM small_files WHERE remote_id = ?1",
+                params![key],
+            );
+        }
+    }
+
     /// Retrieve BLOB content by cache key.  Returns `None` on cache miss
     /// or DB error.
     pub fn get_small_file(&self, key: &str) -> Option<Vec<u8>> {
