@@ -614,6 +614,12 @@ impl ObjectManager {
             }
             self.content_cache.insert(&key, content.to_vec());
         } else {
+            // Evict any stale moka entry so get_content() does not return stale
+            // small-file bytes while the real (larger) content lives on disk.
+            // This covers the pattern: flush(0 bytes) → moka[key]=[] → then
+            // flush(100 KB) → without eviction moka still returns [] on the
+            // next get_content() call, causing UploadManager to upload 0 bytes.
+            self.content_cache.remove(&key);
             self.disk_cache.insert(&key, content);
         }
     }
@@ -631,6 +637,8 @@ impl ObjectManager {
             }
             self.content_cache.insert(key, content.to_vec());
         } else {
+            // Evict any stale moka entry (same reason as in store_content_bytes).
+            self.content_cache.remove(key);
             self.disk_cache.insert(key, content);
         }
     }

@@ -1522,6 +1522,12 @@ impl Filesystem for GDriveFuse {
             })
         } else {
             Box::new(move || {
+                // Settling delay: Chrome issues rename() AFTER release(), so
+                // obj.get_metadata(&pending_id) may still return the old
+                // .crdownload name if we read it immediately.  Sleep briefly
+                // so rename_pending() has time to update the in-memory map.
+                std::thread::sleep(Duration::from_millis(1_500));
+
                 let size = content.len() as u64;
                 // Guard: if the pending placeholder was already promoted to a
                 // real Drive ID while this task was sitting in the upload queue

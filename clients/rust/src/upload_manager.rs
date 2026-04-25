@@ -38,7 +38,7 @@ use crate::gclient::GClient;
 use crate::object_manager::ObjectManager;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Returns `true` when `e` wraps an HTTP 404 response from the Drive API.
 ///
@@ -148,6 +148,32 @@ impl UploadManager {
 
         if is_new {
             // ── New file: create on Drive ──────────────────────────────────
+
+            // Settling delay for the rename-after-release race.
+            //
+            // Chrome downloads always close the file handle BEFORE issuing the
+            // rename (*.crdownload → *.pdf).  Because notify_tx wakes the
+            // UploadManager immediately after release(), the old snapshot from
+            // list_dirty_entries() and even the fresh re-read from SQLite can
+            // both land BEFORE rename_pending() has updated the DB row.
+            //
+            // We wait up to NEW_FILE_SETTLE_MS for the row to stabilise.
+            // Crash-recovery entries have a last_fetch timestamp from a
+            // previous session (age ≥ 2 s) and are exempt from the delay.
+            const NEW_FILE_SETTLE_MS: u64 = 1_500;
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let age_secs = now_secs.saturating_sub(meta.last_fetch);
+            if age_secs < 2 {
+                let sleep_ms = NEW_FILE_SETTLE_MS.saturating_sub(age_secs.saturating_mul(1_000));
+                debug!(
+                    "upload-manager: settling new '{}' for {}ms (age={}s)",
+                    meta.name, sleep_ms, age_secs
+                );
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+            }
 
             // Re-read the most up-to-date name and parent_id from SQLite right
             // before the API call.  The list_dirty_entries() snapshot may be
