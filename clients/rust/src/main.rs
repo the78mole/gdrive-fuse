@@ -5,6 +5,7 @@
 
 mod auth;
 mod cache_cleaner;
+mod config_manager;
 mod db_manager;
 mod dup_mapping;
 mod fuse_ops;
@@ -50,28 +51,40 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialise logging
+    // Load (or create) runtime config before anything else.
+    let cfg = config_manager::ConfigManager::load_or_create()
+        .unwrap_or_else(|e| {
+            eprintln!("config: failed to load config ({}), using defaults", e);
+            config_manager::Config::default()
+        });
+    let cfg = Arc::new(cfg);
+
+    // Initialise logging: --debug > RUST_LOG env > config log.level > "info".
     if args.debug && std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "debug");
+    } else if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", &cfg.log.level);
     }
     env_logger::init();
 
     info!("gdrive-fuse-rs starting, mountpoint: {}", args.mountpoint.display());
 
-    // Resolve credentials: runtime arg/env > compiled-in default.
+    // Resolve credentials: CLI arg/env > config file > compiled-in default.
     let client_id = args
         .client_id
+        .or_else(|| cfg.oauth.client_id.clone())
         .or_else(|| BUILTIN_CLIENT_ID.map(str::to_string))
         .context(
             "CLIENT_ID is required: pass --client-id, set CLIENT_ID env var, \
-             or compile with CLIENT_ID set",
+             add client_id to config.toml, or compile with CLIENT_ID set",
         )?;
     let client_secret = args
         .client_secret
+        .or_else(|| cfg.oauth.client_secret.clone())
         .or_else(|| BUILTIN_CLIENT_SECRET.map(str::to_string))
         .context(
             "CLIENT_SECRET is required: pass --client-secret, set CLIENT_SECRET env var, \
-             or compile with CLIENT_SECRET set",
+             add client_secret to config.toml, or compile with CLIENT_SECRET set",
         )?;
 
     // Authenticate
@@ -100,7 +113,7 @@ fn main() -> Result<()> {
 
     // Build FUSE filesystem handler
     let obj = Arc::new(match maybe_db.clone() {
-        Some(db) => object_manager::ObjectManager::new_with_db(db),
+        Some(db) => object_manager::ObjectManager::new_with_db_and_config(db, Arc::clone(&cfg)),
         None => object_manager::ObjectManager::new(),
     });
     let queue = queue_manager::QueueManager::new(Arc::clone(&obj), Arc::clone(&client));
@@ -137,6 +150,7 @@ fn main() -> Result<()> {
         let cleaner = Arc::new(cache_cleaner::CacheCleaner::new(
             Arc::clone(db),
             content_dir.clone(),
+            cfg.cache.disk_max_bytes,
         ));
         cleaner.start();
     }
@@ -149,6 +163,7 @@ fn main() -> Result<()> {
             db,
             obj_for_sync,
             Arc::clone(&client),
+            cfg.sync_interval(),
         ));
         sync.start();
     }

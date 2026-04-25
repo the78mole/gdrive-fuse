@@ -20,8 +20,8 @@
 use crate::db_manager::DbManager;
 use crate::dup_mapping::DupMapping;
 use crate::gclient::{FileInfo, GClient};
-use crate::object_manager::{
-    ObjectManager, ROOT_INO, TTL, CACHE_STREAM_THRESHOLD_BYTES, INODE_DUPLICATES,
+use crate::object_manager::
+    {ObjectManager, ROOT_INO, INODE_DUPLICATES,
     desktop_content, is_workspace_type,
 };
 use crate::queue_manager::{Priority, QueueManager, TaskKey};
@@ -46,10 +46,10 @@ struct WriteEntry {
     /// Drive file ID of an *existing* file being overwritten, or `None` for
     /// newly created files that have not yet been uploaded to Drive.
     file_id: Option<String>,
-    /// RAM write buffer.  Used for files ≤ `CACHE_STREAM_THRESHOLD_BYTES`.
+    /// RAM write buffer.  Used for files ≤ `self.stream_threshold`.
     /// Empty when `write_tmp` is `Some`.
     content: Vec<u8>,
-    /// Disk-backed write buffer for large files (> `CACHE_STREAM_THRESHOLD_BYTES`).
+    /// Disk-backed write buffer for large files (> `self.stream_threshold`).
     ///
     /// When `Some`, all `write()` calls go to this temp file via seek + write;
     /// `content` stays empty.  The file is removed in `release()`.  Any
@@ -74,27 +74,22 @@ pub struct GDriveFuse {
     write_buffers: DashMap<u64, WriteEntry>,
     /// Monotonically increasing file handle counter.
     next_fh: AtomicU64,
-    /// Sender end of the dedicated upload thread pool.  Closures submitted
-    /// here execute on one of `UPLOAD_THREADS` background threads.
+    /// Sender end of the dedicated upload thread pool.
     upload_tx: Sender<Box<dyn FnOnce() + Send + 'static>>,
-    /// Number of uploads currently in-flight or queued.  Shared with the
-    /// `QueueManager` so Low-prio prefetch workers pause automatically.
+    /// Number of uploads currently in-flight or queued.
     active_uploads: Arc<AtomicUsize>,
-    /// Sender end of the reply-dispatcher pool.  FUSE callbacks that would
-    /// block (cache miss → Drive API call) move their `reply` handle here
-    /// and return immediately, keeping the single FUSE event-loop thread free
-    /// to accept the next kernel request.  The pool thread issues the API
-    /// call and sends the reply when it is ready.
+    /// Sender end of the reply-dispatcher pool.
     reply_tx: Sender<Box<dyn FnOnce() + Send + 'static>>,
-    /// When present, `release()` uses write-back mode: content is persisted
-    /// to the local cache, `is_dirty` is set in SQLite, and a wakeup ping is
-    /// sent here so `UploadManager` uploads the entry on its next cycle.
-    /// When `None` (no `DbManager`), `release()` falls back to the original
-    /// direct-upload path so behaviour is identical to Phase 3.
+    /// When present, `release()` uses write-back mode.
     upload_notify_tx: Option<Sender<()>>,
-    /// SQLite database handle — used for the virtual `/.duplicates` file and
-    /// GC-related queries.  `None` when running without a persistent cache.
+    /// SQLite database handle.
     db: Option<Arc<DbManager>>,
+    /// FUSE attribute TTL — how long the kernel caches entry/attr replies.
+    /// Set from `Config::cache.dir_ttl_secs` at mount time.
+    dir_ttl: Duration,
+    /// Files larger than this are served via HTTP Range requests, never cached.
+    /// Set from `Config::cache.stream_threshold_bytes` at mount time.
+    stream_threshold: u64,
 }
 
 impl GDriveFuse {
@@ -166,6 +161,8 @@ impl GDriveFuse {
                 .expect("failed to spawn upload thread");
         }
         Self {
+            dir_ttl: obj.dir_ttl(),
+            stream_threshold: obj.stream_threshold(),
             obj,
             queue,
             dup_map,
@@ -458,7 +455,7 @@ impl Filesystem for GDriveFuse {
 
         // Virtual read-only file visible in the root directory.
         if parent.0 == ROOT_INO && name_str == ".duplicates" {
-            reply.entry(&TTL, &Self::duplicates_attr(), Generation(0));
+            reply.entry(&self.dir_ttl, &Self::duplicates_attr(), Generation(0));
             return;
         }
 
@@ -474,7 +471,7 @@ impl Filesystem for GDriveFuse {
             for (unique_name, f) in self.dup_map.resolve(&files) {
                 if unique_name == name_str.as_str() {
                     let ino = self.obj.get_or_alloc_ino(&f.id);
-                    reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
+                    reply.entry(&self.dir_ttl, &ObjectManager::make_file_attr(ino, f), Generation(0));
                     return;
                 }
             }
@@ -486,6 +483,7 @@ impl Filesystem for GDriveFuse {
         let obj = Arc::clone(&self.obj);
         let queue = Arc::clone(&self.queue);
         let dup_map = Arc::clone(&self.dup_map);
+        let dir_ttl = self.dir_ttl;
         self.reply_tx
             .send(Box::new(move || {
                 let files = match queue.enqueue_and_wait(
@@ -505,7 +503,7 @@ impl Filesystem for GDriveFuse {
                 for (unique_name, f) in dup_map.resolve(&files) {
                     if unique_name == name_str.as_str() {
                         let ino = obj.get_or_alloc_ino(&f.id);
-                        reply.entry(&TTL, &ObjectManager::make_file_attr(ino, f), Generation(0));
+                        reply.entry(&dir_ttl, &ObjectManager::make_file_attr(ino, f), Generation(0));
                         return;
                     }
                 }
@@ -520,12 +518,12 @@ impl Filesystem for GDriveFuse {
         debug!("getattr ino={}", ino.0);
 
         if ino.0 == ROOT_INO {
-            reply.attr(&TTL, &Self::root_attr());
+            reply.attr(&self.dir_ttl, &Self::root_attr());
             return;
         }
 
         if ino.0 == INODE_DUPLICATES {
-            reply.attr(&TTL, &Self::duplicates_attr());
+            reply.attr(&self.dir_ttl, &Self::duplicates_attr());
             return;
         }
 
@@ -536,7 +534,7 @@ impl Filesystem for GDriveFuse {
 
         // Fast path: metadata already in cache.
         if let Some(info) = self.obj.get_metadata(&file_id) {
-            reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info));
+            reply.attr(&self.dir_ttl, &ObjectManager::make_file_attr(ino.0, &info));
             return;
         }
 
@@ -544,6 +542,7 @@ impl Filesystem for GDriveFuse {
         // event-loop thread can immediately accept the next kernel request.
         let obj = Arc::clone(&self.obj);
         let queue = Arc::clone(&self.queue);
+        let dir_ttl = self.dir_ttl;
         self.reply_tx
             .send(Box::new(move || {
                 if let Err(e) = queue
@@ -555,7 +554,7 @@ impl Filesystem for GDriveFuse {
                 }
                 match obj.get_metadata(&file_id) {
                     Some(info) => {
-                        reply.attr(&TTL, &ObjectManager::make_file_attr(ino.0, &info))
+                        reply.attr(&dir_ttl, &ObjectManager::make_file_attr(ino.0, &info))
                     }
                     None => {
                         error!("getattr ino={}: metadata missing after fetch", ino.0);
@@ -727,7 +726,7 @@ impl Filesystem for GDriveFuse {
         //    FUSE event-loop thread can immediately accept the next kernel request
         //    while this thread downloads the file from Google Drive.
         //
-        //    Files larger than CACHE_STREAM_THRESHOLD_BYTES (64 MiB) are served
+        //    Files larger than self.stream_threshold (64 MiB) are served
         //    via an HTTP Range request that delivers *only* the requested window
         //    — the full file is never downloaded.  This prevents OOM when the
         //    user seeks in a multi-gigabyte video while only needing 128 KiB per
@@ -742,7 +741,7 @@ impl Filesystem for GDriveFuse {
             .map(|f| f.size)
             .unwrap_or(0);
 
-        if file_size > CACHE_STREAM_THRESHOLD_BYTES {
+        if file_size > self.stream_threshold {
             info!(
                 "read (stream-range): \"{}\" (id={}) size={} offset={} len={}",
                 file_name, file_id, file_size, offset, size
@@ -849,7 +848,7 @@ impl Filesystem for GDriveFuse {
                 self.obj.invalidate_dir(&parent_id);
                 let ino = self.obj.get_or_alloc_ino(&info.id);
                 self.obj.store_metadata(info.clone());
-                reply.entry(&TTL, &ObjectManager::make_file_attr(ino, &info), Generation(0));
+                reply.entry(&self.dir_ttl, &ObjectManager::make_file_attr(ino, &info), Generation(0));
             }
             Err(e) => {
                 error!("mkdir '{}': {}", name_str, e);
@@ -1094,7 +1093,7 @@ impl Filesystem for GDriveFuse {
         );
 
         let attr = ObjectManager::make_file_attr(ino, &placeholder);
-        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+        reply.created(&self.dir_ttl, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
 
     // ── open ───────────────────────────────────────────────────────────────
@@ -1132,7 +1131,7 @@ impl Filesystem for GDriveFuse {
             let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
             // ── Large-file branch: disk-backed write buffer ─────────────────
-            // For files > CACHE_STREAM_THRESHOLD_BYTES (64 MiB) we avoid
+            // For files > self.stream_threshold (64 MiB) we avoid
             // holding the full content in RAM for the duration of the open.
             // Instead we seed a temp file on disk and use seek+write for every
             // `write()` call.  Only at `release()` time do we briefly load the
@@ -1141,7 +1140,7 @@ impl Filesystem for GDriveFuse {
             // For O_TRUNC we still create the temp file but start it empty —
             // no seeding needed.
             let file_size = self.obj.get_metadata(&file_id).map(|f| f.size).unwrap_or(0);
-            if file_size > CACHE_STREAM_THRESHOLD_BYTES {
+            if file_size > self.stream_threshold {
                 let tmp_path = self.obj.write_tmp_dir().join(format!("{}.write", fh));
 
                 if truncate {
@@ -1531,7 +1530,7 @@ impl Filesystem for GDriveFuse {
 
         // Return current (or updated) attributes.
         if ino.0 == ROOT_INO {
-            reply.attr(&TTL, &Self::root_attr());
+            reply.attr(&self.dir_ttl, &Self::root_attr());
             return;
         }
 
@@ -1544,10 +1543,10 @@ impl Filesystem for GDriveFuse {
                 if let Some(new_size) = size {
                     attr.size = new_size;
                 }
-                reply.attr(&TTL, &attr);
+                reply.attr(&self.dir_ttl, &attr);
             }
             None => {
-                reply.attr(&TTL, &Self::root_attr());
+                reply.attr(&self.dir_ttl, &Self::root_attr());
             }
         }
     }
@@ -1624,7 +1623,7 @@ mod tests {
     /// Files ≤ 4 KiB must stay in RAM only.
     #[test]
     fn large_file_on_disk_small_file_in_ram() {
-        use crate::object_manager::CACHE_RAM_MAX_BYTES;
+        const CACHE_RAM_MAX_BYTES: u64 = 4 * 1024; // matches Config default
         let tmp = TempDir::new().unwrap();
 
         // ── Large file (16 KiB > 4 KiB threshold) ───────────────────────────

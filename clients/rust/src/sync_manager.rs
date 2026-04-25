@@ -30,19 +30,19 @@ use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How often to poll the Drive changes feed.
-const SYNC_INTERVAL: Duration = Duration::from_secs(30);
-
 /// Spawns and manages the background Drive change-poll loop.
 pub struct SyncManager {
     db: Arc<DbManager>,
     obj: Arc<ObjectManager>,
     client: Arc<GClient>,
+    /// How often to poll the Drive changes feed.  Set from
+    /// [`Config::sync.interval_secs`] at construction time.
+    interval: Duration,
 }
 
 impl SyncManager {
-    pub fn new(db: Arc<DbManager>, obj: Arc<ObjectManager>, client: Arc<GClient>) -> Self {
-        Self { db, obj, client }
+    pub fn new(db: Arc<DbManager>, obj: Arc<ObjectManager>, client: Arc<GClient>, interval: Duration) -> Self {
+        Self { db, obj, client, interval }
     }
 
     /// Spawn the background "gdrive-sync" thread.
@@ -50,16 +50,17 @@ impl SyncManager {
     /// The thread is detached — it runs until the process exits.  Holding an
     /// `Arc<SyncManager>` keeps the DB, ObjectManager and GClient alive.
     pub fn start(self: Arc<Self>) {
+        let interval = self.interval;
         std::thread::Builder::new()
             .name("gdrive-sync".to_string())
             .spawn(move || self.run())
             .expect("spawn gdrive-sync thread");
-        info!("sync: background change-watcher started (interval={:?})", SYNC_INTERVAL);
+        info!("sync: background change-watcher started (interval={:?})", interval);
     }
 
     fn run(&self) {
         loop {
-            std::thread::sleep(SYNC_INTERVAL);
+            std::thread::sleep(self.interval);
             if let Err(e) = self.poll_once() {
                 warn!("sync: poll error — {:#}", e);
             }

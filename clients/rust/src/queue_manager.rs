@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn download_large_file_stored_on_disk_not_in_ram() {
-        use crate::object_manager::CACHE_RAM_MAX_BYTES;
+        const CACHE_RAM_MAX_BYTES: u64 = 4 * 1024; // matches Config default
         use tempfile::TempDir;
 
         // A file clearly above the RAM threshold (16 KiB).

@@ -20,14 +20,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-/// Maximum total byte size of the on-disk content cache.
-///
-/// When the combined size of all files in
-/// `~/.cache/gdrive-fuse-rs/content/` exceeds this limit, the cleaner
-/// evicts the oldest-accessed files until the usage drops back below the
-/// threshold.
-pub const MAX_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
-
 /// How often the cleaner wakes to check the cache size.
 const CLEAN_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
 
@@ -35,22 +27,27 @@ const CLEAN_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
 pub struct CacheCleaner {
     db: Arc<DbManager>,
     content_dir: PathBuf,
+    /// Maximum total byte size of the on-disk content cache before LRU
+    /// eviction kicks in.  Set from [`Config::cache.disk_max_bytes`] at
+    /// construction time.
+    max_disk_bytes: u64,
 }
 
 impl CacheCleaner {
-    pub fn new(db: Arc<DbManager>, content_dir: PathBuf) -> Self {
-        Self { db, content_dir }
+    pub fn new(db: Arc<DbManager>, content_dir: PathBuf, max_disk_bytes: u64) -> Self {
+        Self { db, content_dir, max_disk_bytes }
     }
 
     /// Spawn the background `"gdrive-cache-cleaner"` thread.
     pub fn start(self: Arc<Self>) {
+        let max_gib = self.max_disk_bytes / (1024 * 1024 * 1024);
         std::thread::Builder::new()
             .name("gdrive-cache-cleaner".to_string())
             .spawn(move || self.run())
             .expect("spawn gdrive-cache-cleaner thread");
         info!(
             "cache-cleaner: started (limit={} GiB, interval={:?})",
-            MAX_DISK_CACHE_BYTES / (1024 * 1024 * 1024),
+            max_gib,
             CLEAN_INTERVAL
         );
     }
@@ -75,14 +72,14 @@ impl CacheCleaner {
         debug!(
             "cache-cleaner: total={} MiB, limit={} GiB",
             total_bytes / (1024 * 1024),
-            MAX_DISK_CACHE_BYTES / (1024 * 1024 * 1024)
+            self.max_disk_bytes / (1024 * 1024 * 1024)
         );
 
-        if total_bytes <= MAX_DISK_CACHE_BYTES {
+        if total_bytes <= self.max_disk_bytes {
             return;
         }
 
-        let over_by = total_bytes - MAX_DISK_CACHE_BYTES;
+        let over_by = total_bytes - self.max_disk_bytes;
         info!(
             "cache-cleaner: {} MiB over limit — starting LRU eviction",
             over_by / (1024 * 1024)

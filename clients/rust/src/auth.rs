@@ -1,15 +1,21 @@
 //! OAuth2 Authorization Code Flow for Google Drive.
 //!
-//! Stores and reloads tokens from `~/.gdrive_tokens_rs.json`.
+//! Stores and reloads tokens from
+//! `~/.local/state/gdrive-fuse-rs/token.json` (XDG state directory).
+//! The file is always written with mode `0600` and the permissions are
+//! verified on every load — a world-readable token file is rejected with a
+//! clear error so the problem is never silently ignored on headless servers.
+//!
 //! Thread-safe: the access token is guarded by a `parking_lot::Mutex`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
@@ -37,11 +43,31 @@ pub struct Auth {
 impl Auth {
     /// Construct a new `Auth` object and attempt to load saved tokens.
     pub fn new(client_id: String, client_secret: String) -> Result<Self> {
-        let token_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".gdrive_tokens_rs.json");
+        let token_path = dirs::state_dir()
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".local")
+                    .join("state")
+            })
+            .join("gdrive-fuse-rs")
+            .join("token.json");
 
-        let token = Self::load_tokens(&token_path).ok();
+        let token = match Self::load_tokens(&token_path) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                // Log permission errors at warn level so headless servers
+                // surface the problem immediately rather than silently
+                // falling through to a new auth flow.
+                let msg = e.to_string();
+                if msg.contains("insecure permissions") {
+                    warn!("auth: {}", msg);
+                } else {
+                    debug!("auth: no saved token ({})", msg);
+                }
+                None
+            }
+        };
 
         Ok(Self {
             client_id,
@@ -155,14 +181,48 @@ impl Auth {
     }
 
     fn load_tokens(path: &PathBuf) -> Result<TokenData> {
+        // Refuse to load a token file that is readable by group or others.
+        match fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "token file {} has insecure permissions ({:03o}). \
+                         Run `chmod 600 {}` to fix this.",
+                        path.display(),
+                        mode,
+                        path.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File does not exist yet — normal on first run.
+                return Err(e.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         let data = fs::read_to_string(path)?;
         Ok(serde_json::from_str(&data)?)
     }
 
     fn save_tokens(&self, token: &TokenData) -> Result<()> {
-        // Never log the token content
+        // Create the parent directory if it does not exist yet.
+        if let Some(parent) = self.token_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write the file first, then tighten permissions.
+        // Never log the token content.
         fs::write(&self.token_path, serde_json::to_string_pretty(token)?)?;
-        debug!("Tokens saved to {}", self.token_path.display());
+
+        // Enforce mode 0600 — only the owner may read or write.
+        fs::set_permissions(
+            &self.token_path,
+            fs::Permissions::from_mode(0o600),
+        )?;
+
+        debug!("Tokens saved to {} (mode 0600)", self.token_path.display());
         Ok(())
     }
 }

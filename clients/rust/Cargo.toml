@@ -16,9 +16,10 @@ fuser = "0.17"
 # HTTP client (blocking API to keep FUSE callbacks synchronous)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
-# JSON
+# JSON / TOML
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # URL-encode OAuth2 query params (no oauth2 crate — raw HTTP flow)
 urlencoding = "2"

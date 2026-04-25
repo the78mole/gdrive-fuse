@@ -15,6 +15,7 @@
 //! Manager.  Workers call `store_*` methods; FUSE callbacks call `get_*`
 //! methods.
 
+use crate::config_manager::Config;
 use crate::db_manager::DbManager;
 use crate::gclient::{DirListing, FileInfo};
 use chrono::DateTime;
@@ -29,32 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-pub const TTL: Duration = Duration::from_secs(30);
 pub const ROOT_INO: u64 = 1;
 /// Reserved inode for the virtual `/.duplicates` file that reports
 /// all files sharing the same MD5 checksum across the Drive corpus.
 pub const INODE_DUPLICATES: u64 = 3;
-
-/// Files at or below this size are stored in the **RAM** content cache on
-/// first read.  Larger files are written atomically to `~/.gdrive/cache/<id>`
-/// on disk — they survive remounts without re-downloading and never exhaust
-/// process memory.  Each `read()` for a cached large file issues a single
-/// `seek()` + `read_exact()` on the local file; no HTTP request is needed.
-pub const CACHE_RAM_MAX_BYTES: u64 = 4 * 1024; // 4 KiB → RAM
-
-/// Maximum total byte capacity of the in-memory `moka` content cache.
-/// Moka uses a weigher (bytes) for eviction, so this is a hard byte limit.
-/// Entries are also subject to `CACHE_MOKA_TTL`.
-pub const CACHE_MOKA_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
-
-/// Time-to-live for entries in the in-memory `moka` content cache.
-pub const CACHE_MOKA_TTL: Duration = Duration::from_secs(600); // 10 minutes
-
-/// Files larger than this threshold are served via HTTP Range requests for
-/// every `read()` call — they are never written to the disk cache.  This
-/// prevents multi-gigabyte downloads when the user only reads a small window
-/// of a large file (e.g. seeking in a video).
-pub const CACHE_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB → streaming
 
 // ── ContentCache — moka-backed TTL cache ──────────────────────────────────
 
@@ -73,14 +52,15 @@ pub struct ContentCache {
 }
 
 impl ContentCache {
-    pub fn new() -> Self {
+    /// Create a content cache with the given byte capacity and TTL.
+    fn new(max_bytes: u64, ttl: Duration) -> Self {
         let cache = moka::sync::Cache::builder()
-            .max_capacity(CACHE_MOKA_MAX_BYTES)
+            .max_capacity(max_bytes)
             .weigher(|_k: &String, v: &Arc<Vec<u8>>| {
                 // Moka weigher must return u32; cap at u32::MAX for safety.
                 v.len().min(u32::MAX as usize) as u32
             })
-            .time_to_live(CACHE_MOKA_TTL)
+            .time_to_live(ttl)
             .build();
         Self { inner: cache }
     }
@@ -224,10 +204,9 @@ pub struct ObjectManager {
     pub metadata: DashMap<String, FileInfo>,
     /// Parent Drive ID → directory listing.
     pub dir_cache: DashMap<String, DirEntry>,
-    /// Drive file ID → downloaded bytes (byte-bounded LRU cache, files ≤ 4 KiB).
+    /// Drive file ID → downloaded bytes (byte-bounded LRU cache, RAM tier).
     pub content_cache: ContentCache,
     /// Drive file ID → downloaded bytes on disk (`~/.cache/gdrive-fuse-rs/content/<id>`).
-    /// Used for files > CACHE_RAM_MAX_BYTES to avoid RAM pressure.
     disk_cache: DiskCache,
     /// Optional persistent SQLite-backed cache layer.
     db: Option<Arc<DbManager>>,
@@ -236,35 +215,23 @@ pub struct ObjectManager {
     pub name_index: DashMap<String, String>,
     /// Directory for disk-backed write buffers used by large-file writable
     /// `open()` calls (`~/.cache/gdrive-fuse-rs/write-tmp/`).
-    /// Each open handle gets a `<fh>.write` file while the handle is live;
-    /// it is removed in `release()` and any leftovers are purged at startup.
     write_tmp_dir: PathBuf,
+    /// Runtime configuration (cache limits, TTLs, thresholds).
+    config: Arc<Config>,
 }
 
 impl ObjectManager {
-    /// Production constructor — uses XDG cache directory.
-    /// Does **not** require a `DbManager`; the in-memory + disk caches are
-    /// still used.  Pass the returned instance to `QueueManager`; if a
-    /// `DbManager` is also available prefer [`ObjectManager::new_with_db`].
+    /// Production constructor — uses XDG cache directory and default config.
+    /// Prefer [`ObjectManager::new_with_db_and_config`] for production use.
     pub fn new() -> Self {
-        let content_dir = dirs::cache_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
-            .join("gdrive-fuse-rs")
-            .join("content");
-        Self::new_with_disk_dir_and_db(content_dir, None)
+        let content_dir = Self::xdg_content_dir();
+        Self::new_with_disk_dir_and_db(content_dir, None, Arc::new(Config::default()))
     }
 
-    /// Production constructor with an active `DbManager`.
-    ///
-    /// Small-file content (≤ 4 KiB) is written to both moka **and** the
-    /// SQLite BLOB store.  On a cache miss, the DB is consulted before
-    /// returning `None` — surviving a process restart without re-downloading.
-    pub fn new_with_db(db: Arc<DbManager>) -> Self {
-        let content_dir = dirs::cache_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
-            .join("gdrive-fuse-rs")
-            .join("content");
-        Self::new_with_disk_dir_and_db(content_dir, Some(db))
+    /// Production constructor — full config supplied by the caller.
+    pub fn new_with_db_and_config(db: Arc<DbManager>, config: Arc<Config>) -> Self {
+        let content_dir = Self::xdg_content_dir();
+        Self::new_with_disk_dir_and_db(content_dir, Some(db), config)
     }
 
     /// Test-only constructor: stores disk-cache entries in `cache_dir` instead
@@ -273,10 +240,17 @@ impl ObjectManager {
     #[cfg(test)]
     pub fn new_for_test(cache_dir: PathBuf) -> Self {
         let db = DbManager::new(&cache_dir.join("metadata.db")).ok();
-        Self::new_with_disk_dir_and_db(cache_dir, db)
+        Self::new_with_disk_dir_and_db(cache_dir, db, Arc::new(Config::default()))
     }
 
-    fn new_with_disk_dir_and_db(cache_dir: PathBuf, db: Option<Arc<DbManager>>) -> Self {
+    fn xdg_content_dir() -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+            .join("gdrive-fuse-rs")
+            .join("content")
+    }
+
+    fn new_with_disk_dir_and_db(cache_dir: PathBuf, db: Option<Arc<DbManager>>, config: Arc<Config>) -> Self {
         // Write-tmp dir lives next to the content dir (e.g. write-tmp/ sibling
         // to content/).  We clean up any *.write files left by a previous crash
         // so stale large-file write buffers never accumulate on disk.
@@ -320,23 +294,47 @@ impl ObjectManager {
                 max_restored_ino + 1
             );
         }
+        let content_cache = ContentCache::new(
+            config.cache.moka_max_bytes,
+            config.moka_ttl(),
+        );
         Self {
             next_ino: AtomicU64::new(max_restored_ino + 1),
             ino_to_id,
             id_to_ino,
             metadata: DashMap::new(),
             dir_cache: DashMap::new(),
-            content_cache: ContentCache::new(),
+            content_cache,
             disk_cache: DiskCache::new(cache_dir),
             db,
             name_index: DashMap::new(),
             write_tmp_dir,
+            config,
         }
     }
 
     /// Directory to use for disk-backed write buffers of large files.
     pub fn write_tmp_dir(&self) -> &std::path::Path {
         &self.write_tmp_dir
+    }
+
+    /// FUSE attribute/entry TTL — how long the kernel caches dir/file attrs.
+    #[inline]
+    pub fn dir_ttl(&self) -> Duration {
+        self.config.dir_ttl()
+    }
+
+    /// Files larger than this byte threshold are served via Range requests;
+    /// they are never written to the disk cache.
+    #[inline]
+    pub fn stream_threshold(&self) -> u64 {
+        self.config.cache.stream_threshold_bytes
+    }
+
+    /// Maximum RAM-tier cache entry size in bytes.
+    #[inline]
+    fn ram_max_bytes(&self) -> u64 {
+        self.config.cache.ram_max_bytes
     }
 
     /// Copy disk-cached content for `file_id` to `dest` without loading the
@@ -389,7 +387,7 @@ impl ObjectManager {
         // = false) must not short-circuit the caller — the incomplete entry
         // would appear as a directory with only its first 10 files visible.
         if entry.state == DirCacheState::Fresh
-            && entry.fetched_at.elapsed() < TTL
+            && entry.fetched_at.elapsed() < self.dir_ttl()
             && entry.is_complete
         {
             Some(Arc::clone(&entry.files))
@@ -414,7 +412,7 @@ impl ObjectManager {
     /// cold fetch.  Returns `None` for missing, fresh, or ETag-less entries.
     pub fn get_stale_etag(&self, parent_id: &str) -> Option<String> {
         let entry = self.dir_cache.get(parent_id)?;
-        if entry.fetched_at.elapsed() >= TTL && !entry.etag.is_empty() {
+        if entry.fetched_at.elapsed() >= self.dir_ttl() && !entry.etag.is_empty() {
             Some(entry.etag.clone())
         } else {
             None
@@ -549,7 +547,7 @@ impl ObjectManager {
     /// pending files fall back to `file_id`.
     pub fn store_content_bytes(&self, file_id: &str, content: &[u8]) {
         let key = self.cache_key_for(file_id);
-        if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
+        if content.len() as u64 <= self.ram_max_bytes() {
             if let Some(db) = &self.db {
                 db.store_small_file(&key, content);
             }
@@ -566,7 +564,7 @@ impl ObjectManager {
     /// may not be set yet when this is called, so `cache_key_for` would
     /// incorrectly return the MD5 for a file that is about to become dirty).
     pub fn store_content_at_key(&self, key: &str, content: &[u8]) {
-        if content.len() as u64 <= CACHE_RAM_MAX_BYTES {
+        if content.len() as u64 <= self.ram_max_bytes() {
             if let Some(db) = &self.db {
                 db.store_small_file(key, content);
             }
@@ -1249,7 +1247,7 @@ mod tests {
 
     #[test]
     fn store_content_moka_insert_and_len() {
-        let cache = ContentCache::new();
+        let cache = ContentCache::new(256 * 1024 * 1024, Duration::from_secs(600));
         cache.insert("a", vec![0u8; 4]);
         cache.insert("b", vec![0u8; 4]);
         // Both entries are present immediately after insertion.
@@ -1259,7 +1257,7 @@ mod tests {
 
     #[test]
     fn store_content_replace_returns_new_value() {
-        let cache = ContentCache::new();
+        let cache = ContentCache::new(256 * 1024 * 1024, Duration::from_secs(600));
         cache.insert("f1", vec![0u8; 10]);
         cache.insert("f1", vec![0u8; 3]);
         let got = cache.get("f1").expect("should be cached");
