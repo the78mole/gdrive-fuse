@@ -443,16 +443,63 @@ impl ObjectManager {
             self.name_index
                 .insert(make_name_key(parent_id, &f.name, &f.mime_type), f.id.clone());
         }
+        // Carry forward any in-flight pending placeholders from the outgoing
+        // cache entry.  Drive's listing never includes not-yet-uploaded files,
+        // so without this a Nemo/Nautilus refresh (or 30 s TTL expiry) would
+        // silently drop the placeholder and make the downloading file vanish.
+        //
+        // Secondary path: also check `pending_parents` for pendings that exist
+        // in the metadata map but were never in a previous cache entry (e.g.
+        // created when no dir cache existed yet).
+        let pending_from_old_cache: Vec<FileInfo> = self
+            .dir_cache
+            .get(parent_id)
+            .map(|e| {
+                e.files
+                    .iter()
+                    .filter(|f| f.id.starts_with("__pending__"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut files = listing.files;
+        for pending in pending_from_old_cache {
+            if !files.iter().any(|f| f.id == pending.id) {
+                debug!(
+                    "store_dir_listing: re-injecting pending '{}' ('{}') into '{}'",
+                    pending.id, pending.name, parent_id
+                );
+                files.push(pending);
+            }
+        }
+        // Also re-inject pending files known via pending_parents whose metadata
+        // is in the metadata map (handles the case where inject_pending_into_dir
+        // was called before any cache entry existed for this parent).
+        for kv in self.pending_parents.iter() {
+            if kv.value() == parent_id {
+                let pending_id = kv.key().clone();
+                if !files.iter().any(|f| f.id == pending_id) {
+                    if let Some(meta) = self.metadata.get(&pending_id) {
+                        debug!(
+                            "store_dir_listing: re-injecting pending '{}' ('{}') into '{}' via pending_parents",
+                            pending_id, meta.name, parent_id
+                        );
+                        files.push(meta.clone());
+                    }
+                }
+            }
+        }
         debug!(
             "store_dir_listing('{}'): {} files, etag={}",
             parent_id,
-            listing.files.len(),
+            files.len(),
             listing.etag
         );
         self.dir_cache.insert(
             parent_id.to_string(),
             DirEntry {
-                files: Arc::new(listing.files),
+                files: Arc::new(files),
                 etag: listing.etag,
                 fetched_at: std::time::Instant::now(),
                 state: DirCacheState::Fresh,
@@ -1244,6 +1291,37 @@ mod tests {
         obj.store_dir_listing("p", listing(vec![f], "e"));
         let ino = obj.get_or_alloc_ino("child-id");
         assert_eq!(obj.ino_to_drive_id(ino), Some("child-id".to_string()));
+    }
+
+    #[test]
+    fn store_dir_listing_reinjjects_pending_placeholders() {
+        // Simulate: create() injects pending, then dir cache is refreshed from
+        // Drive (which does not know about the pending file).
+        // store_dir_listing must re-inject the pending so it stays visible.
+        let obj = ObjectManager::new();
+        // Pre-seed a dir listing so inject_pending_into_dir can attach to it.
+        let existing = file("real-id", "existing.txt", "text/plain", 10, false);
+        obj.store_dir_listing("parent-1", listing(vec![existing.clone()], "etag-1"));
+
+        // Inject a pending placeholder (simulates FUSE create()).
+        let pending = file("__pending__5", "download.pdf", "application/octet-stream", 0, false);
+        obj.inject_pending_into_dir("parent-1", pending.clone());
+
+        // Verify the pending file is visible before the refresh.
+        let before = obj.get_cached_dir("parent-1").expect("should be cached");
+        assert!(before.iter().any(|f| f.id == "__pending__5"), "pending missing before refresh");
+
+        // Now simulate a Drive refresh that returns only the real file (pending not on Drive yet).
+        obj.store_dir_listing("parent-1", listing(vec![existing.clone()], "etag-2"));
+
+        // Pending must survive the refresh.
+        let after = obj.get_cached_dir("parent-1").expect("should be cached after refresh");
+        assert!(
+            after.iter().any(|f| f.id == "__pending__5"),
+            "pending was lost after dir cache refresh"
+        );
+        // Real file must also still be present.
+        assert!(after.iter().any(|f| f.id == "real-id"), "real file lost after refresh");
     }
 
     // ── metadata ──────────────────────────────────────────────────────────
