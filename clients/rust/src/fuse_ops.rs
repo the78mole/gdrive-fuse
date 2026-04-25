@@ -1456,6 +1456,28 @@ impl Filesystem for GDriveFuse {
             content
         };
 
+        // Guard: don't upload a brand-new pending file with zero content.
+        //
+        // Chrome (and other tools) sometimes use this sequence:
+        //   create("file.crdownload") → release(0 bytes)   ← empty handle
+        //   open("file.crdownload")   → write(content) → release(content)
+        //
+        // If we upload the 0-byte version immediately, the UploadManager
+        // finishes `finalize_new_file` + `migrate_cache_key` + `replace_pending_id`
+        // while the real content is arriving, causing one of:
+        //   • the 100 KB write_local_dirty to operate on a pending_id that no
+        //     longer has a DB row → content silently dropped, 0-byte file on Drive
+        //   • a duplicate Drive file to be created (direct-upload path)
+        //
+        // Skipping the upload here is safe: the pending placeholder remains
+        // visible in the directory listing.  The subsequent write cycle
+        // (open → write → release with actual content) will call
+        // write_local_dirty / queue a CREATE task with the real bytes.
+        if file_id.is_none() && content.is_empty() {
+            debug!("release: skipping empty new-file upload for pending '{}'", effective_id);
+            return;
+        }
+
         // ── Write-back path (UploadManager present) ────────────────────────
         // Persist content locally + mark dirty.  The UploadManager wakes up
         // and uploads asynchronously, so FUSE returns immediately.
@@ -1485,6 +1507,7 @@ impl Filesystem for GDriveFuse {
         // soon as we know an upload is incoming, not only when it starts.
         active_uploads.fetch_add(1, Ordering::Relaxed);
 
+        let ino_val = ino.0;
         let task: Box<dyn FnOnce() + Send + 'static> = if let Some(fid) = file_id {
             Box::new(move || {
                 // Invalidate any cached chunks before the upload so a
@@ -1500,6 +1523,28 @@ impl Filesystem for GDriveFuse {
         } else {
             Box::new(move || {
                 let size = content.len() as u64;
+                // Guard: if the pending placeholder was already promoted to a
+                // real Drive ID while this task was sitting in the upload queue
+                // (i.e. a concurrent release for the same file finished first),
+                // update the existing file instead of creating a duplicate.
+                if let Some(real_id) = obj.ino_to_drive_id(ino_val) {
+                    if !real_id.starts_with("__pending__") {
+                        debug!(
+                            "upload: pending '{}' already promoted to '{}' — updating instead",
+                            pending_id, real_id
+                        );
+                        obj.invalidate_content(&real_id);
+                        match client.update_file_content(&real_id, content) {
+                            Ok(updated) => obj.store_metadata(updated),
+                            Err(e) => error!(
+                                "upload: update_file_content '{}' (late-promote): {}",
+                                real_id, e
+                            ),
+                        }
+                        active_uploads.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 // Re-read the name from live metadata — rename_pending() may have
                 // updated it if Chrome renamed the .crdownload file to the final
                 // name after release() was called (write buffer already removed).
