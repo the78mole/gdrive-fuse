@@ -21,13 +21,13 @@ jobs:
       full: ${{ steps.compose.outputs.full }}  # e.g. 1.2.3  or  1.2.3-pr15-3-gabcdef
       deb:  ${{ steps.compose.outputs.deb }}   # Debian-compatible, e.g. 1.2.3  or  1.2.3~pr15.3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0   # full history required by paulhatch/semantic-version
 
       - name: Compute semantic version
         id: semver
-        uses: paulhatch/semantic-version@v5.4.0
+        uses: paulhatch/semantic-version@v6.0.2
         with:
           tag_prefix: "v"
           # Conventional Commits: feat! / BREAKING CHANGE → major, feat → minor, rest → patch
@@ -72,7 +72,7 @@ jobs:
       GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: |
@@ -132,7 +132,7 @@ jobs:
             "gdrive-fuse-cpp_${DEB_VERSION}_${DEB_ARCH}.deb"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gdrive-fuse-cpp_${{ matrix.deb_arch }}
           path: clients/cpp/gdrive-fuse-cpp_*.deb
@@ -155,7 +155,7 @@ jobs:
       GDRIVE_FUSE_VERSION: ${{ needs.compute-version.outputs.full }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         run: |
@@ -180,7 +180,7 @@ jobs:
         run: cargo deb --deb-version "${DEB_VERSION}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gdrive-fuse-rs_${{ matrix.deb_arch }}
           path: clients/rust/target/debian/*.deb
@@ -195,7 +195,7 @@ jobs:
 
     steps:
       - name: Download all .deb artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: debs
           merge-multiple: true
@@ -204,7 +204,7 @@ jobs:
         run: find debs -name "*.deb" | sort
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: debs/*.deb
           generate_release_notes: true
