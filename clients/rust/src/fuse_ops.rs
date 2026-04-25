@@ -1227,10 +1227,21 @@ impl Filesystem for GDriveFuse {
                 }
             };
 
+            // For pending files (not yet on Drive), recover the parent Drive ID
+            // so that release() can correctly call create_file() if the upload
+            // has not completed by the time this handle is released.
+            let parent_id = if file_id.starts_with("__pending__") {
+                self.obj
+                    .get_pending_parent(&file_id)
+                    .unwrap_or_default()
+            } else {
+                String::new() // not needed for real-file updates
+            };
+
             self.write_buffers.insert(
                 fh,
                 WriteEntry {
-                    parent_id: String::new(), // not needed for updates
+                    parent_id,
                     name,
                     file_id: Some(file_id),
                     content: initial_content,
@@ -1392,7 +1403,44 @@ impl Filesystem for GDriveFuse {
         reply.ok();
 
         let WriteEntry { file_id, name, parent_id, content, write_tmp } = entry;
-        let pending_id = format!("__pending__{}", fh.0);
+
+        // ── Pending file_id resolution ─────────────────────────────────────
+        // If this write buffer was opened via open() on an already-pending
+        // placeholder (e.g. Chrome reopens the .crdownload file), file_id is
+        // "__pending__<N>" from the original create() — NOT a real Drive ID.
+        // Passing that to update_file_content() always 404s on Drive and
+        // silently drops the content.
+        //
+        // Resolve using the current ino → Drive-ID mapping which is authoritative:
+        //   • If the pending upload already completed, ino_to_drive_id returns the
+        //     real Drive ID → take the UPDATE path, no parent_id needed.
+        //   • If still pending, treat this release as a CREATE using the original
+        //     pending_id (from file_id) and the parent recovered in open().
+        let (file_id, pending_id) = match file_id {
+            Some(ref id) if id.starts_with("__pending__") => {
+                match self.obj.ino_to_drive_id(ino.0) {
+                    Some(real_id) if !real_id.starts_with("__pending__") => {
+                        // Upload already finished — update the real Drive file.
+                        debug!(
+                            "release: pending fh={} resolved to real id='{}', using update path",
+                            fh.0, real_id
+                        );
+                        (Some(real_id), format!("__pending__{}", fh.0))
+                    }
+                    _ => {
+                        // Still pending — create as a new Drive file.
+                        let pid = id.clone();
+                        debug!(
+                            "release: pending fh={} still unresolved, using create path (pid='{}')",
+                            fh.0, pid
+                        );
+                        (None, pid)
+                    }
+                }
+            }
+            _ => (file_id, format!("__pending__{}", fh.0)),
+        };
+
         let effective_id = file_id.clone().unwrap_or_else(|| pending_id.clone());
 
         // For disk-backed large-file handles: read the temp file into memory
@@ -1412,7 +1460,16 @@ impl Filesystem for GDriveFuse {
         // Persist content locally + mark dirty.  The UploadManager wakes up
         // and uploads asynchronously, so FUSE returns immediately.
         if let Some(ref notify_tx) = self.upload_notify_tx {
-            self.obj.write_local_dirty(&effective_id, &content, &parent_id, &name);
+            // If parent_id is empty (write buffer was opened via open() on a
+            // pending file before this fix), recover from pending_parents.
+            let effective_parent = if parent_id.is_empty() && file_id.is_none() {
+                self.obj
+                    .get_pending_parent(&effective_id)
+                    .unwrap_or_default()
+            } else {
+                parent_id
+            };
+            self.obj.write_local_dirty(&effective_id, &content, &effective_parent, &name);
             notify_tx
                 .send(())
                 .unwrap_or_else(|_| error!("release: upload_notify channel closed"));
@@ -1443,7 +1500,14 @@ impl Filesystem for GDriveFuse {
         } else {
             Box::new(move || {
                 let size = content.len() as u64;
-                match client.create_file(&name, &parent_id, content) {
+                // Re-read the name from live metadata — rename_pending() may have
+                // updated it if Chrome renamed the .crdownload file to the final
+                // name after release() was called (write buffer already removed).
+                let upload_name = obj
+                    .get_metadata(&pending_id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or(name);
+                match client.create_file(&upload_name, &parent_id, content) {
                     Ok(mut new_info) => {
                         if new_info.size == 0 {
                             new_info.size = size;
@@ -1453,7 +1517,7 @@ impl Filesystem for GDriveFuse {
                         obj.replace_pending_id(&pending_id, &parent_id, new_info);
                     }
                     Err(e) => {
-                        error!("upload: create_file '{}': {}", name, e);
+                        error!("upload: create_file '{}': {}", upload_name, e);
                         // Remove the stale placeholder from cache and dir listing.
                         obj.remove_pending_from_dir(&parent_id, &pending_id);
                     }

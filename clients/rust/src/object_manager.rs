@@ -213,6 +213,11 @@ pub struct ObjectManager {
     /// `"{parent_id}:{display_name}"` → `file_id` — populated by every dir
     /// store so `lookup` can resolve in O(1) without scanning the listing.
     pub name_index: DashMap<String, String>,
+    /// `pending_id` → `parent_drive_id` — injected by `inject_pending_into_dir`
+    /// so that `open()` on a still-pending file can recover the parent folder
+    /// Drive ID that was captured at `create()` time.  Entries are removed
+    /// once the pending placeholder is replaced by the real Drive ID.
+    pending_parents: DashMap<String, String>,
     /// Directory for disk-backed write buffers used by large-file writable
     /// `open()` calls (`~/.cache/gdrive-fuse-rs/write-tmp/`).
     write_tmp_dir: PathBuf,
@@ -308,9 +313,18 @@ impl ObjectManager {
             disk_cache: DiskCache::new(cache_dir),
             db,
             name_index: DashMap::new(),
+            pending_parents: DashMap::new(),
             write_tmp_dir,
             config,
         }
+    }
+
+    /// Look up the parent Drive folder ID for a pending placeholder.
+    ///
+    /// Returns `None` if the pending file was never injected (rare) or has
+    /// already been promoted to a real Drive ID via `replace_pending_id`.
+    pub fn get_pending_parent(&self, pending_id: &str) -> Option<String> {
+        self.pending_parents.get(pending_id).map(|v| v.clone())
     }
 
     /// Directory to use for disk-backed write buffers of large files.
@@ -767,6 +781,7 @@ impl ObjectManager {
     /// visible on the next `readdir` after the Drive listing is fetched.
     pub fn inject_pending_into_dir(&self, parent_id: &str, info: FileInfo) {
         self.get_or_alloc_ino(&info.id);
+        self.pending_parents.insert(info.id.clone(), parent_id.to_string());
         self.name_index
             .insert(make_name_key(parent_id, &info.name, &info.mime_type), info.id.clone());
         if let Some(mut entry) = self.dir_cache.get_mut(parent_id) {
@@ -820,6 +835,23 @@ impl ObjectManager {
                 f.name = new_name.to_string();
             }
         }
+        // 5. Update the pending_parents map so open() always finds the current parent.
+        self.pending_parents.insert(pending_id.to_string(), new_parent_id.to_string());
+        // 6. Persist updated name/parent to SQLite — keeps UploadManager in sync
+        //    when rename() arrives after release() has already called
+        //    write_local_dirty() (e.g. Chrome renames .crdownload → final name).
+        if let Some(db) = &self.db {
+            if let Some(meta) = db.get_metadata(pending_id) {
+                let _ = db.store_metadata(
+                    pending_id,
+                    meta.inode,
+                    new_parent_id,
+                    new_name,
+                    meta.md5_checksum.as_deref(),
+                    meta.is_dirty,
+                );
+            }
+        }
         debug!(
             "rename_pending: '{}' → '{}' (parent '{}' → '{}')",
             pending_id, new_name, old_parent_id, new_parent_id
@@ -829,6 +861,7 @@ impl ObjectManager {
     /// Remove a pending placeholder from the parent's dir-cache (upload
     /// failed path).  Cleans up metadata, name-index and inode maps.
     pub fn remove_pending_from_dir(&self, parent_id: &str, old_id: &str) {
+        self.pending_parents.remove(old_id);
         if let Some((_, meta)) = self.metadata.remove(old_id) {
             let key = make_name_key(parent_id, &meta.name, &meta.mime_type);
             self.name_index.remove(&key);
@@ -853,6 +886,8 @@ impl ObjectManager {
     /// The inode assigned to `old_id` is reused for `new_info.id` so that
     /// open file handles remain valid across the flush.
     pub fn replace_pending_id(&self, old_id: &str, parent_id: &str, new_info: FileInfo) {
+        // Remove the pending-parent record — the file now has a real Drive ID.
+        self.pending_parents.remove(old_id);
         // Swap ino maps.
         if let Some((_, ino)) = self.id_to_ino.remove(old_id) {
             self.ino_to_id.insert(ino, new_info.id.clone());
