@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # FUSE3 bindings
-fuser = "0.17"
+fuser = "0.18"
 
 # HTTP client (blocking API to keep FUSE callbacks synchronous)
 reqwest = { version = "0.13", features = ["blocking", "json", "form", "native-tls"] }
