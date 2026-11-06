@@ -25,7 +25,7 @@ toml = "1.0"
 urlencoding = "2"
 
 # Credentials / token persistence
-dirs = "6"
+dirs = "7"
 
 # Logging
 log = "0.4"
